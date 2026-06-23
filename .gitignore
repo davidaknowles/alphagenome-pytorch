@@ -62,6 +62,7 @@ log.txt
 
 # Exploration / experiment outputs
 explore/
+finetuning_output/
 
 # SLURM job outputs
 scripts/*.out
