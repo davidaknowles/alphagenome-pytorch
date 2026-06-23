@@ -1220,6 +1220,7 @@ def train_epoch_multihead(
     epoch: int,
     log_every: int,
     use_amp: bool = True,
+    amp_dtype: torch.dtype = torch.bfloat16,
     accumulation_steps: int = 1,
     frozen_backbone: bool = False,
     num_segments: int = NUM_SEGMENTS,
@@ -1255,6 +1256,7 @@ def train_epoch_multihead(
         epoch: Current epoch number.
         log_every: Log frequency in steps.
         use_amp: Whether to use automatic mixed precision.
+        amp_dtype: Autocast dtype to use when AMP is enabled.
         accumulation_steps: Number of batches to accumulate gradients over.
         frozen_backbone: If True, use torch.no_grad() for backbone.
         num_segments: Number of segments for multinomial loss.
@@ -1347,12 +1349,12 @@ def train_epoch_multihead(
         if encoder_only:
             # Run only the CNN encoder; backbone is always frozen in encoder-only mode.
             with torch.no_grad():
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                     outputs = model(sequences, organism_idx, encoder_only=True)
             embeddings_dict = {128: outputs["encoder_output"].detach()}
         elif frozen_backbone:
             with torch.no_grad():
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                     outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
 
             embeddings_dict = {}
@@ -1361,7 +1363,7 @@ def train_epoch_multihead(
                 if emb_key in outputs:
                     embeddings_dict[res] = outputs[emb_key].detach()
         else:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                 outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
 
             embeddings_dict = {}
@@ -1390,7 +1392,7 @@ def train_epoch_multihead(
             res_weights = resolution_weights.get(modality, {})
             targets_dict = modality_targets[modality]
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                 predictions = head(
                     embeddings_dict, organism_idx, return_scaled=True, channels_last=True
                 )
@@ -1580,6 +1582,7 @@ def validate_multihead(
     positional_weight: float,
     count_weight: float,
     use_amp: bool = True,
+    amp_dtype: torch.dtype = torch.bfloat16,
     num_segments: int = NUM_SEGMENTS,
     min_segment_size: int | None = None,
     compute_pearson: bool = True,
@@ -1599,6 +1602,7 @@ def validate_multihead(
         positional_weight: Weight for positional component.
         count_weight: Weight for count component.
         use_amp: Whether to use automatic mixed precision.
+        amp_dtype: Autocast dtype to use when AMP is enabled.
         num_segments: Number of segments for multinomial loss.
         min_segment_size: Minimum positions per segment.
         compute_pearson: Whether to compute Pearson R metrics.
@@ -1650,7 +1654,7 @@ def validate_multihead(
                 outputs = model(sequences, organism_idx, encoder_only=True)
                 embeddings_dict = {128: outputs["encoder_output"]}
             else:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                     outputs = model(sequences, organism_idx, return_embeddings=True, resolutions=resolutions, channels_last=False)
 
                 embeddings_dict = {}
@@ -1671,7 +1675,7 @@ def validate_multihead(
 
                 head_module = head.module if hasattr(head, "module") else head
 
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+                with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                     predictions_scaled = head(
                         embeddings_dict, organism_idx, return_scaled=True, channels_last=True
                     )

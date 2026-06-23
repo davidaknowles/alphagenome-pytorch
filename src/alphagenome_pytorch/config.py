@@ -77,8 +77,11 @@ class DtypePolicy:
         """
         dtype_map = {
             "float32": torch.float32,
+            "fp32": torch.float32,
             "float16": torch.float16,
+            "fp16": torch.float16,
             "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
         }
 
         kwargs = {}
@@ -142,6 +145,33 @@ class DtypePolicy:
             params_dtype=torch.float32,
             compute_dtype=torch.bfloat16,
             output_dtype=torch.bfloat16,
+        )
+
+    @classmethod
+    def float16_compute(cls) -> "DtypePolicy":
+        """Mixed-precision policy with float16 compute and float32 params."""
+        return cls(
+            params_dtype=torch.float32,
+            compute_dtype=torch.float16,
+            output_dtype=torch.float16,
+        )
+
+    @classmethod
+    def aggressive_bfloat16(cls) -> "DtypePolicy":
+        """Aggressive low-memory policy storing params and activations in bfloat16."""
+        return cls(
+            params_dtype=torch.bfloat16,
+            compute_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+        )
+
+    @classmethod
+    def aggressive_float16(cls) -> "DtypePolicy":
+        """Aggressive low-memory policy storing params and activations in float16."""
+        return cls(
+            params_dtype=torch.float16,
+            compute_dtype=torch.float16,
+            output_dtype=torch.float16,
         )
 
     def cast_to_compute(self, x: torch.Tensor) -> torch.Tensor:

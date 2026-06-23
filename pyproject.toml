@@ -51,6 +51,9 @@ finetuning = [
     "tqdm",
     "pyfaidx",
 ]
+lowprec = [
+    "torchao",
+]
 scoring = [
     "pyfaidx",
     "pandas",

@@ -92,6 +92,10 @@ torch._dynamo.config.suppress_errors = True
 # AlphaGenome imports
 from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.config import DtypePolicy
+from alphagenome_pytorch.low_precision import (
+    Float8ConversionStats,
+    convert_linears_to_float8_training,
+)
 from alphagenome_pytorch.sequence_parallel import SequenceParallelism
 from alphagenome_pytorch.extensions.finetuning import (
     # Data
@@ -449,8 +453,55 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dtype",
         type=str,
         default="bfloat16",
-        choices=["bfloat16", "float32"],
-        help="Model dtype",
+        choices=[
+            "bfloat16",
+            "float32",
+            "float16",
+            "bfloat16-params",
+            "float16-params",
+            "nvfp8",
+        ],
+        help=(
+            "Precision preset. bfloat16/float16 keep parameters in float32 and "
+            "use AMP compute; *-params also stores model parameters in that "
+            "16-bit dtype. nvfp8 stores parameters in bfloat16 and converts "
+            "eligible Linear layers to torchao Float8Linear training kernels."
+        ),
+    )
+    model.add_argument(
+        "--dtype-policy",
+        type=str,
+        default=None,
+        help=(
+            "Explicit policy string, e.g. "
+            "'params=bfloat16,compute=bfloat16,output=bfloat16'. "
+            "Overrides --dtype."
+        ),
+    )
+    model.add_argument(
+        "--fp8-recipe",
+        type=str,
+        default="rowwise",
+        choices=["tensorwise", "rowwise", "rowwise_with_gw_hp"],
+        help=(
+            "torchao float8 recipe used by --dtype nvfp8. rowwise is the "
+            "default because it is more numerically robust than tensorwise."
+        ),
+    )
+    model.add_argument(
+        "--fp8-min-feature-multiple",
+        type=int,
+        default=16,
+        help="Only convert Linear layers whose input/output features are divisible by this value.",
+    )
+    model.add_argument(
+        "--fp8-skip-name-patterns",
+        type=str,
+        default="heads,original_layer,lora_,locon_,ia3,adapter",
+        help=(
+            "Comma-separated fully-qualified-name substrings to exclude from "
+            "torchao float8 conversion."
+        ),
     )
     model.add_argument(
         "--head-init-scheme",
@@ -646,6 +697,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "locon_alpha",
         "locon_targets",
         "dtype",
+        "dtype_policy",
+        "fp8_recipe",
+        "fp8_min_feature_multiple",
+        "fp8_skip_name_patterns",
         "head_init_scheme",
         "gradient_checkpointing",
         "epochs",
@@ -1059,7 +1114,13 @@ def create_model(
     rank: int,
     world_size: int,
     local_rank: int,
-) -> tuple[nn.Module, dict[str, nn.Module], list[torch.nn.Parameter], TransferConfig | None]:
+) -> tuple[
+    nn.Module,
+    dict[str, nn.Module],
+    list[torch.nn.Parameter],
+    TransferConfig | None,
+    Float8ConversionStats | None,
+]:
     """Create and configure the model based on training mode.
 
     Args:
@@ -1078,9 +1139,31 @@ def create_model(
     print_rank0(f"Loading pretrained model from {args.pretrained_weights}", rank)
 
     # Dtype policy
-    dtype_policy = (
-        DtypePolicy.full_float32() if args.dtype == "float32" else DtypePolicy.mixed_precision()
-    )
+    if args.dtype_policy:
+        dtype_policy = DtypePolicy.from_string(args.dtype_policy)
+    elif args.dtype == "float32":
+        dtype_policy = DtypePolicy.full_float32()
+    elif args.dtype == "float16":
+        dtype_policy = DtypePolicy.float16_compute()
+    elif args.dtype == "bfloat16-params":
+        dtype_policy = DtypePolicy.aggressive_bfloat16()
+    elif args.dtype == "float16-params":
+        dtype_policy = DtypePolicy.aggressive_float16()
+    elif args.dtype == "nvfp8":
+        dtype_policy = DtypePolicy.aggressive_bfloat16()
+        print_rank0(
+            "nvfp8 preset selected: using bfloat16 parameter storage/compute "
+            "with torchao float8 Linear training conversion.",
+            rank,
+        )
+        if not args.compile:
+            print_rank0(
+                "Warning: torchao float8 training is fastest with --compile; "
+                "running without compile for compatibility.",
+                rank,
+            )
+    else:
+        dtype_policy = DtypePolicy.mixed_precision()
     print_rank0(f"Dtype policy: {dtype_policy}", rank)
 
     model = AlphaGenome(
@@ -1229,8 +1312,36 @@ def create_model(
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
 
-    # Move to device
-    model = model.to(device)
+    # Move to device. When the policy stores parameters in 16-bit, apply it
+    # after adapters/heads are attached so newly-created trainable modules use
+    # the same storage dtype as the trunk.
+    if dtype_policy.params_dtype == torch.float32:
+        model = model.to(device)
+    else:
+        model = model.to(device=device, dtype=dtype_policy.params_dtype)
+
+    fp8_stats: Float8ConversionStats | None = None
+    if args.dtype == "nvfp8":
+        fp8_skip_name_patterns = tuple(
+            pattern.strip()
+            for pattern in args.fp8_skip_name_patterns.split(",")
+            if pattern.strip()
+        )
+        fp8_stats = convert_linears_to_float8_training(
+            model,
+            recipe=args.fp8_recipe,
+            min_feature_multiple=args.fp8_min_feature_multiple,
+            skip_name_patterns=fp8_skip_name_patterns,
+        )
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        print_rank0(
+            "torchao FP8 conversion: "
+            f"recipe={fp8_stats.recipe}, "
+            f"converted={fp8_stats.converted_linears}, "
+            f"skipped={fp8_stats.skipped_linears}, "
+            f"min_feature_multiple={fp8_stats.min_feature_multiple}",
+            rank,
+        )
 
     # Wrap with DDP if multi-GPU
     if world_size > 1:
@@ -1254,7 +1365,7 @@ def create_model(
     n_total = sum(p.numel() for p in model_module.parameters())
     print_rank0(f"Trainable: {n_trainable:,} / {n_total:,} ({100*n_trainable/n_total:.2f}%)", rank)
 
-    return model, heads, trainable_params, transfer_config
+    return model, heads, trainable_params, transfer_config, fp8_stats
 
 
 # =============================================================================
@@ -1344,7 +1455,7 @@ def main(args: argparse.Namespace | None = None) -> None:
     modality_track_means = broadcast_object(modality_track_means, src=0)
 
     # Create model
-    model, heads, trainable_params, transfer_config = create_model(
+    model, heads, trainable_params, transfer_config, fp8_stats = create_model(
         args,
         modality_track_names,
         modality_track_means,
@@ -1496,6 +1607,8 @@ def main(args: argparse.Namespace | None = None) -> None:
         "use_amp": not args.no_amp,
         "gradient_checkpointing": args.gradient_checkpointing,
         "dtype": args.dtype,
+        "dtype_policy": repr(model_module.dtype_policy),
+        "fp8": fp8_stats.__dict__ if fp8_stats is not None else None,
         "world_size": world_size,
         "seed": args.seed,
         "resumed_from": str(resume_path) if resume_path else None,
@@ -1513,7 +1626,8 @@ def main(args: argparse.Namespace | None = None) -> None:
         resume_id=wandb_run_id if resume_path else None,
     )
 
-    use_amp = not args.no_amp
+    amp_dtype = model_module.dtype_policy.compute_dtype
+    use_amp = not args.no_amp and amp_dtype != torch.float32
 
     # Preemption handler state
     current_epoch = start_epoch
@@ -1639,6 +1753,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                     epoch=epoch,
                     log_every=args.log_every,
                     use_amp=use_amp,
+                    amp_dtype=amp_dtype,
                     accumulation_steps=args.gradient_accumulation_steps,
                     frozen_backbone=frozen_backbone,
                     train_sampler=train_sampler,
@@ -1671,6 +1786,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                 positional_weight=args.positional_weight,
                 count_weight=args.count_weight,
                 use_amp=use_amp,
+                amp_dtype=amp_dtype,
                 num_segments=args.num_segments,
                 min_segment_size=args.min_segment_size,
                 compute_pearson=True,

@@ -157,7 +157,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-alpha", type=int, default=16)
     parser.add_argument("--lora-targets", default="q_proj,v_proj")
     parser.add_argument("--resolutions", default="1,128")
-    parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
+    parser.add_argument(
+        "--dtype",
+        choices=(
+            "bfloat16",
+            "float32",
+            "float16",
+            "bfloat16-params",
+            "float16-params",
+            "nvfp8",
+        ),
+        default="bfloat16",
+    )
+    parser.add_argument(
+        "--fp8-recipe",
+        choices=("tensorwise", "rowwise", "rowwise_with_gw_hp"),
+        default="rowwise",
+    )
+    parser.add_argument("--fp8-min-feature-multiple", type=int, default=16)
+    parser.add_argument(
+        "--fp8-skip-name-patterns",
+        default="heads,original_layer,lora_,locon_,ia3,adapter",
+    )
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--track-means-samples", type=_positive_int_or_none, default=256)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -260,6 +281,12 @@ def main() -> None:
         args.lora_targets,
         "--dtype",
         args.dtype,
+        "--fp8-recipe",
+        args.fp8_recipe,
+        "--fp8-min-feature-multiple",
+        str(args.fp8_min_feature_multiple),
+        "--fp8-skip-name-patterns",
+        args.fp8_skip_name_patterns,
         "--num-workers",
         str(args.num_workers),
         "--max-io-workers",

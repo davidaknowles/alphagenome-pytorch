@@ -53,6 +53,27 @@ class TestDtypePolicyFactoryMethods:
         assert policy.compute_dtype == torch.float32
         assert policy.output_dtype == torch.float32
 
+    def test_float16_compute_factory(self):
+        """float16_compute() keeps params in float32 and computes in float16."""
+        policy = DtypePolicy.float16_compute()
+        assert policy.params_dtype == torch.float32
+        assert policy.compute_dtype == torch.float16
+        assert policy.output_dtype == torch.float16
+
+    def test_aggressive_bfloat16_factory(self):
+        """aggressive_bfloat16() stores params and activations in bfloat16."""
+        policy = DtypePolicy.aggressive_bfloat16()
+        assert policy.params_dtype == torch.bfloat16
+        assert policy.compute_dtype == torch.bfloat16
+        assert policy.output_dtype == torch.bfloat16
+
+    def test_aggressive_float16_factory(self):
+        """aggressive_float16() stores params and activations in float16."""
+        policy = DtypePolicy.aggressive_float16()
+        assert policy.params_dtype == torch.float16
+        assert policy.compute_dtype == torch.float16
+        assert policy.output_dtype == torch.float16
+
 
 class TestDtypePolicyFromString:
     """Test from_string() parsing."""
@@ -77,6 +98,13 @@ class TestDtypePolicyFromString:
         assert policy.params_dtype == torch.float16
         assert policy.compute_dtype == torch.float32
         assert policy.output_dtype == torch.bfloat16
+
+    def test_dtype_aliases(self):
+        """Short dtype aliases can be parsed."""
+        policy = DtypePolicy.from_string("params=bf16,compute=fp16,output=fp32")
+        assert policy.params_dtype == torch.bfloat16
+        assert policy.compute_dtype == torch.float16
+        assert policy.output_dtype == torch.float32
 
     def test_whitespace_handling(self):
         """Whitespace is stripped correctly."""
