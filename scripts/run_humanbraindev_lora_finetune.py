@@ -192,6 +192,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-io-workers", type=int, default=16)
     parser.add_argument("--profile-batches", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--cache-genome", action="store_true")
     parser.add_argument("--cache-signals", action="store_true")
     parser.add_argument("--save-delta", action="store_true", default=True)
@@ -313,6 +314,8 @@ def main() -> None:
 
     if args.run_name:
         cmd.extend(["--run-name", args.run_name])
+    if args.seed is not None:
+        cmd.extend(["--seed", str(args.seed)])
     if args.track_means_samples is not None:
         cmd.extend(["--track-means-samples", str(args.track_means_samples)])
     if args.gradient_checkpointing:

@@ -51,6 +51,7 @@ weights/
 # Logs
 *.log
 log.txt
+logs/
 
 # Test data
 **/mock_data/

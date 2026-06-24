@@ -60,6 +60,7 @@ cmd=(
 [[ -n "${LIMIT_VALID:-}" ]] && cmd+=(--limit-valid "$LIMIT_VALID")
 [[ -n "${LIMIT_TEST:-}" ]] && cmd+=(--limit-test "$LIMIT_TEST")
 [[ -n "${LIMIT_BIGWIGS:-}" ]] && cmd+=(--limit-bigwigs "$LIMIT_BIGWIGS")
+[[ -n "${SEED:-}" ]] && cmd+=(--seed "$SEED")
 [[ -n "${GRADIENT_CHECKPOINTING:-}" ]] && cmd+=(--gradient-checkpointing)
 [[ -n "${CACHE_GENOME:-}" ]] && cmd+=(--cache-genome)
 [[ -n "${CACHE_SIGNALS:-}" ]] && cmd+=(--cache-signals)
