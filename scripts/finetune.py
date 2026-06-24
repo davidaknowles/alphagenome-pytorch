@@ -93,7 +93,10 @@ torch._dynamo.config.suppress_errors = True
 from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.config import DtypePolicy
 from alphagenome_pytorch.low_precision import (
+    Float4ConversionStats,
     Float8ConversionStats,
+    convert_linears_to_nvfp4_qat_training,
+    convert_linears_to_nvfp4_weight_only,
     convert_linears_to_float8_training,
 )
 from alphagenome_pytorch.sequence_parallel import SequenceParallelism
@@ -460,12 +463,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "bfloat16-params",
             "float16-params",
             "nvfp8",
+            "nvfp4",
         ],
         help=(
             "Precision preset. bfloat16/float16 keep parameters in float32 and "
             "use AMP compute; *-params also stores model parameters in that "
             "16-bit dtype. nvfp8 stores parameters in bfloat16 and converts "
-            "eligible Linear layers to torchao Float8Linear training kernels."
+            "eligible Linear layers to torchao Float8Linear training kernels. "
+            "nvfp4 stores trainable params in bfloat16 and converts eligible "
+            "frozen base Linear weights to torchao NVFP4 tensors."
         ),
     )
     model.add_argument(
@@ -481,11 +487,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     model.add_argument(
         "--fp8-recipe",
         type=str,
-        default="rowwise",
+        default="tensorwise",
         choices=["tensorwise", "rowwise", "rowwise_with_gw_hp"],
         help=(
-            "torchao float8 recipe used by --dtype nvfp8. rowwise is the "
-            "default because it is more numerically robust than tensorwise."
+            "torchao float8 recipe used by --dtype nvfp8. tensorwise is the "
+            "default because rowwise axiswise scaling currently fails for "
+            "some AlphaGenome tensor shapes."
         ),
     )
     model.add_argument(
@@ -501,6 +508,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Comma-separated fully-qualified-name substrings to exclude from "
             "torchao float8 conversion."
+        ),
+    )
+    model.add_argument(
+        "--fp4-min-feature-multiple",
+        type=int,
+        default=16,
+        help="Only convert Linear layers whose input/output features are divisible by this value.",
+    )
+    model.add_argument(
+        "--fp4-mode",
+        choices=["qat", "weight-only"],
+        default="qat",
+        help=(
+            "NVFP4 backend mode. qat uses torchao's training-oriented fake "
+            "quantized Linear path; weight-only uses compact NVFP4 frozen "
+            "weights and is experimental for this model."
+        ),
+    )
+    model.add_argument(
+        "--fp4-skip-name-patterns",
+        type=str,
+        default="heads,lora_,locon_,ia3,adapter",
+        help=(
+            "Comma-separated fully-qualified-name substrings to exclude from "
+            "torchao NVFP4 weight conversion."
         ),
     )
     model.add_argument(
@@ -701,6 +733,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "fp8_recipe",
         "fp8_min_feature_multiple",
         "fp8_skip_name_patterns",
+        "fp4_min_feature_multiple",
+        "fp4_mode",
+        "fp4_skip_name_patterns",
         "head_init_scheme",
         "gradient_checkpointing",
         "epochs",
@@ -1120,6 +1155,7 @@ def create_model(
     list[torch.nn.Parameter],
     TransferConfig | None,
     Float8ConversionStats | None,
+    Float4ConversionStats | None,
 ]:
     """Create and configure the model based on training mode.
 
@@ -1162,6 +1198,13 @@ def create_model(
                 "running without compile for compatibility.",
                 rank,
             )
+    elif args.dtype == "nvfp4":
+        dtype_policy = DtypePolicy.aggressive_bfloat16()
+        print_rank0(
+            "nvfp4 preset selected: using bfloat16 trainable parameter "
+            "storage/compute with torchao NVFP4 frozen-weight conversion.",
+            rank,
+        )
     else:
         dtype_policy = DtypePolicy.mixed_precision()
     print_rank0(f"Dtype policy: {dtype_policy}", rank)
@@ -1321,6 +1364,7 @@ def create_model(
         model = model.to(device=device, dtype=dtype_policy.params_dtype)
 
     fp8_stats: Float8ConversionStats | None = None
+    fp4_stats: Float4ConversionStats | None = None
     if args.dtype == "nvfp8":
         fp8_skip_name_patterns = tuple(
             pattern.strip()
@@ -1340,6 +1384,30 @@ def create_model(
             f"converted={fp8_stats.converted_linears}, "
             f"skipped={fp8_stats.skipped_linears}, "
             f"min_feature_multiple={fp8_stats.min_feature_multiple}",
+            rank,
+        )
+    elif args.dtype == "nvfp4":
+        fp4_skip_name_patterns = tuple(
+            pattern.strip()
+            for pattern in args.fp4_skip_name_patterns.split(",")
+            if pattern.strip()
+        )
+        fp4_stats = convert_linears_to_nvfp4_weight_only(
+            model,
+            min_feature_multiple=args.fp4_min_feature_multiple,
+            skip_name_patterns=fp4_skip_name_patterns,
+        ) if args.fp4_mode == "weight-only" else convert_linears_to_nvfp4_qat_training(
+            model,
+            min_feature_multiple=args.fp4_min_feature_multiple,
+            skip_name_patterns=fp4_skip_name_patterns,
+        )
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        print_rank0(
+            "torchao NVFP4 conversion: "
+            f"mode={fp4_stats.mode}, "
+            f"converted={fp4_stats.converted_linears}, "
+            f"skipped={fp4_stats.skipped_linears}, "
+            f"min_feature_multiple={fp4_stats.min_feature_multiple}",
             rank,
         )
 
@@ -1365,7 +1433,7 @@ def create_model(
     n_total = sum(p.numel() for p in model_module.parameters())
     print_rank0(f"Trainable: {n_trainable:,} / {n_total:,} ({100*n_trainable/n_total:.2f}%)", rank)
 
-    return model, heads, trainable_params, transfer_config, fp8_stats
+    return model, heads, trainable_params, transfer_config, fp8_stats, fp4_stats
 
 
 # =============================================================================
@@ -1455,7 +1523,7 @@ def main(args: argparse.Namespace | None = None) -> None:
     modality_track_means = broadcast_object(modality_track_means, src=0)
 
     # Create model
-    model, heads, trainable_params, transfer_config, fp8_stats = create_model(
+    model, heads, trainable_params, transfer_config, fp8_stats, fp4_stats = create_model(
         args,
         modality_track_names,
         modality_track_means,
@@ -1609,6 +1677,7 @@ def main(args: argparse.Namespace | None = None) -> None:
         "dtype": args.dtype,
         "dtype_policy": repr(model_module.dtype_policy),
         "fp8": fp8_stats.__dict__ if fp8_stats is not None else None,
+        "fp4": fp4_stats.__dict__ if fp4_stats is not None else None,
         "world_size": world_size,
         "seed": args.seed,
         "resumed_from": str(resume_path) if resume_path else None,

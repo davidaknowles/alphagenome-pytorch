@@ -166,18 +166,25 @@ def parse_args() -> argparse.Namespace:
             "bfloat16-params",
             "float16-params",
             "nvfp8",
+            "nvfp4",
         ),
         default="bfloat16",
     )
     parser.add_argument(
         "--fp8-recipe",
         choices=("tensorwise", "rowwise", "rowwise_with_gw_hp"),
-        default="rowwise",
+        default="tensorwise",
     )
     parser.add_argument("--fp8-min-feature-multiple", type=int, default=16)
     parser.add_argument(
         "--fp8-skip-name-patterns",
         default="heads,original_layer,lora_,locon_,ia3,adapter",
+    )
+    parser.add_argument("--fp4-min-feature-multiple", type=int, default=16)
+    parser.add_argument("--fp4-mode", choices=("qat", "weight-only"), default="qat")
+    parser.add_argument(
+        "--fp4-skip-name-patterns",
+        default="heads,lora_,locon_,ia3,adapter",
     )
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--track-means-samples", type=_positive_int_or_none, default=256)
@@ -287,6 +294,12 @@ def main() -> None:
         str(args.fp8_min_feature_multiple),
         "--fp8-skip-name-patterns",
         args.fp8_skip_name_patterns,
+        "--fp4-min-feature-multiple",
+        str(args.fp4_min_feature_multiple),
+        "--fp4-mode",
+        args.fp4_mode,
+        "--fp4-skip-name-patterns",
+        args.fp4_skip_name_patterns,
         "--num-workers",
         str(args.num_workers),
         "--max-io-workers",
