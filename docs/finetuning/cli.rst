@@ -61,6 +61,7 @@ override YAML values when both are provided.
       lora_rank: 8                       # LoRA rank (0 disables LoRA, trains heads only)
       lora_alpha: 16                     # LoRA alpha scaling factor
       lora_targets: "q_proj,v_proj"      # Comma-separated list of target modules
+      lora_backend: native               # 'native', 'peft', or 'unsloth'
 
       # Locon configuration (used when mode includes Locon)
       locon_rank: 4

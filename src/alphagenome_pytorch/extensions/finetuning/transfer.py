@@ -36,6 +36,7 @@ import torch.nn as nn
 from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.heads import GenomeTracksHead
 from alphagenome_pytorch.extensions.finetuning.adapters import (
+    apply_hf_lora,
     apply_lora,
     apply_locon,
     apply_ia3,
@@ -72,6 +73,11 @@ class TransferConfig:
         lora_rank: LoRA rank (default: 8).
         lora_alpha: LoRA alpha scaling factor (default: 16).
         lora_targets: Module name substrings to apply LoRA to.
+        lora_backend: LoRA implementation. ``'native'`` uses this repo's
+            lightweight PyTorch wrapper. ``'peft'`` uses Hugging Face PEFT
+            injection. ``'unsloth'`` imports Unsloth first, then uses PEFT
+            injection so Unsloth runtime patches can participate where
+            supported.
         locon_rank: Locon rank (default: 4).
         locon_alpha: Locon alpha scaling factor (default: 1).
         locon_targets: Module name substrings to apply Locon to.
@@ -113,6 +119,7 @@ class TransferConfig:
     lora_rank: int = 8
     lora_alpha: int = 16
     lora_targets: list[str] = field(default_factory=lambda: ['q_proj', 'v_proj'])
+    lora_backend: str = 'native'
     
     # Locon settings
     locon_rank: int = 4
@@ -414,12 +421,31 @@ def prepare_for_transfer(
     
     # Apply adapters in sequence
     if 'lora' in modes:
-        model = apply_lora(
-            model,
-            config.lora_targets,
-            rank=config.lora_rank,
-            alpha=config.lora_alpha,
-        )
+        valid_lora_backends = {'native', 'peft', 'unsloth'}
+        if config.lora_backend not in valid_lora_backends:
+            raise ValueError(
+                f"Invalid lora_backend '{config.lora_backend}'. "
+                f"Must be one of: {sorted(valid_lora_backends)}"
+            )
+        if config.lora_backend == 'native':
+            model = apply_lora(
+                model,
+                config.lora_targets,
+                rank=config.lora_rank,
+                alpha=config.lora_alpha,
+            )
+        else:
+            model = apply_hf_lora(
+                model,
+                config.lora_targets,
+                rank=config.lora_rank,
+                alpha=config.lora_alpha,
+                backend=config.lora_backend,
+            )
+            for head_name in config.new_heads:
+                if hasattr(model, 'heads') and head_name in model.heads:
+                    for param in model.heads[head_name].parameters():
+                        param.requires_grad = True
     
     if 'locon' in modes:
         matched_locon_targets = validate_locon_targets(model, config.locon_targets)

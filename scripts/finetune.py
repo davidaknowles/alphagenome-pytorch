@@ -157,6 +157,7 @@ DEFAULTS = {
     "lora_rank": 8,
     "lora_alpha": 16,
     "lora_targets": "q_proj,v_proj",
+    "lora_backend": "native",
     "locon_rank": 4,
     "locon_alpha": 1,
     "locon_targets": "",
@@ -441,6 +442,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULTS["lora_targets"],
         help="Comma-separated modules for LoRA",
     )
+    model.add_argument(
+        "--lora-backend",
+        type=str,
+        default=DEFAULTS["lora_backend"],
+        choices=["native", "peft", "unsloth"],
+        help=(
+            "LoRA implementation. native uses this repo's wrapper; peft uses "
+            "Hugging Face PEFT injection; unsloth imports Unsloth before PEFT "
+            "injection and is intended for LoRA/Locon experiments."
+        ),
+    )
+    model.add_argument(
+        "--use-unsloth",
+        action="store_true",
+        help="Shortcut for --lora-backend unsloth.",
+    )
     model.add_argument("--locon-rank", type=int, default=DEFAULTS["locon_rank"], help="Locon rank (0 to disable)")
     model.add_argument("--locon-alpha", type=int, default=DEFAULTS["locon_alpha"], help="Locon alpha scaling")
     model.add_argument(
@@ -504,7 +521,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     model.add_argument(
         "--fp8-skip-name-patterns",
         type=str,
-        default="heads,original_layer,lora_,locon_,ia3,adapter",
+        default="heads,original_layer,base_layer,lora_,locon_,ia3,adapter",
         help=(
             "Comma-separated fully-qualified-name substrings to exclude from "
             "torchao float8 conversion."
@@ -725,6 +742,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "lora_rank",
         "lora_alpha",
         "lora_targets",
+        "lora_backend",
+        "use_unsloth",
         "locon_rank",
         "locon_alpha",
         "locon_targets",
@@ -782,6 +801,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if bool(config_data.get("no_cache", False)):
             args.cache_genome = False
             args.cache_signals = False
+
+    if args.use_unsloth:
+        if "--lora-backend" in cli_flags and args.lora_backend != "unsloth":
+            parser.error("--use-unsloth conflicts with --lora-backend values other than 'unsloth'")
+        args.lora_backend = "unsloth"
+    if args.lora_backend in {"peft", "unsloth"} and args.mode not in {"lora", "lora+locon"}:
+        parser.error("--lora-backend peft/unsloth requires --mode lora or --mode lora+locon")
 
     args.global_resolutions = _parse_resolutions_value(args.resolutions, "global resolutions")
     args.resolutions = ",".join(str(r) for r in args.global_resolutions)
@@ -1300,6 +1326,7 @@ def create_model(
         if lora_enabled:
             adapter_modes.append("lora")
             print_rank0(f"Applying LoRA: rank={args.lora_rank}, alpha={args.lora_alpha}", rank)
+            print_rank0(f"  Backend: {args.lora_backend}", rank)
             print_rank0(f"  Target modules: {lora_targets}", rank)
         if locon_enabled:
             validate_locon_targets(model, locon_targets)
@@ -1316,6 +1343,7 @@ def create_model(
                 lora_targets=lora_targets,
                 lora_rank=args.lora_rank,
                 lora_alpha=args.lora_alpha,
+                lora_backend=args.lora_backend,
                 locon_targets=locon_targets,
                 locon_rank=args.locon_rank,
                 locon_alpha=args.locon_alpha,
@@ -1652,6 +1680,8 @@ def main(args: argparse.Namespace | None = None) -> None:
         "lora_rank": args.lora_rank if args.mode in ("lora", "lora+locon") else None,
         "lora_alpha": args.lora_alpha if args.mode in ("lora", "lora+locon") else None,
         "lora_targets": args.lora_targets if args.mode in ("lora", "lora+locon") else None,
+        "lora_backend": args.lora_backend if args.mode in ("lora", "lora+locon") else None,
+        "use_unsloth": args.lora_backend == "unsloth",
         "locon_rank": args.locon_rank if args.mode in ("locon", "lora+locon") else None,
         "locon_alpha": args.locon_alpha if args.mode in ("locon", "lora+locon") else None,
         "locon_targets": args.locon_targets if args.mode in ("locon", "lora+locon") else None,

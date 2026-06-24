@@ -154,9 +154,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--warmup-steps", type=int, default=500)
+    parser.add_argument("--mode", choices=("lora", "lora+locon"), default="lora")
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=int, default=16)
     parser.add_argument("--lora-targets", default="q_proj,v_proj")
+    parser.add_argument("--lora-backend", choices=("native", "peft", "unsloth"), default="native")
+    parser.add_argument("--use-unsloth", action="store_true", help="Shortcut for --lora-backend unsloth")
+    parser.add_argument("--locon-rank", type=int, default=4)
+    parser.add_argument("--locon-alpha", type=int, default=1)
+    parser.add_argument("--locon-targets", default="down_blocks.4,down_blocks.5")
     parser.add_argument("--resolutions", default="1,128")
     parser.add_argument(
         "--dtype",
@@ -179,7 +185,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fp8-min-feature-multiple", type=int, default=16)
     parser.add_argument(
         "--fp8-skip-name-patterns",
-        default="heads,original_layer,lora_,locon_,ia3,adapter",
+        default="heads,original_layer,base_layer,lora_,locon_,ia3,adapter",
     )
     parser.add_argument("--fp4-min-feature-multiple", type=int, default=16)
     parser.add_argument("--fp4-mode", choices=("qat", "weight-only"), default="qat")
@@ -253,7 +259,7 @@ def main() -> None:
         sys.executable,
         str(Path(__file__).with_name("finetune.py")),
         "--mode",
-        "lora",
+        args.mode,
         "--genome",
         str(fasta_path),
         "--modality",
@@ -290,6 +296,8 @@ def main() -> None:
         str(args.lora_alpha),
         "--lora-targets",
         args.lora_targets,
+        "--lora-backend",
+        "unsloth" if args.use_unsloth else args.lora_backend,
         "--dtype",
         args.dtype,
         "--fp8-recipe",
@@ -320,6 +328,17 @@ def main() -> None:
         cmd.extend(["--track-means-samples", str(args.track_means_samples)])
     if args.gradient_checkpointing:
         cmd.append("--gradient-checkpointing")
+    if args.mode == "lora+locon":
+        cmd.extend(
+            [
+                "--locon-rank",
+                str(args.locon_rank),
+                "--locon-alpha",
+                str(args.locon_alpha),
+                "--locon-targets",
+                args.locon_targets,
+            ]
+        )
     if args.cache_genome:
         cmd.append("--cache-genome")
     if args.cache_signals:

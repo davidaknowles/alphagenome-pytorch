@@ -385,7 +385,16 @@ def _get_adapter_module_names(model: nn.Module) -> set[str]:
     )
 
     adapter_types = (LoRA, Locon, IA3, IA3_FF, HoulsbyWrapper, HoulsbyBlockWrapper)
-    return {name for name, module in model.named_modules() if isinstance(module, adapter_types)}
+    adapter_names: set[str] = set()
+    for name, module in model.named_modules():
+        if isinstance(module, adapter_types):
+            adapter_names.add(name)
+        elif (
+            hasattr(module, "base_layer")
+            and (hasattr(module, "lora_A") or hasattr(module, "lora_B"))
+        ):
+            adapter_names.add(name)
+    return adapter_names
 
 
 def _normalize_trunk_key(key: str, adapter_module_names: set[str]) -> str:
@@ -401,7 +410,7 @@ def _normalize_trunk_key(key: str, adapter_module_names: set[str]) -> str:
         → ``tower.blocks.0.mha.q_proj.weight``
     """
     for adapter_name in adapter_module_names:
-        for segment in (".original_layer.", ".block."):
+        for segment in (".original_layer.", ".block.", ".base_layer."):
             prefix = adapter_name + segment
             if key.startswith(prefix):
                 return adapter_name + "." + key[len(prefix):]
@@ -446,6 +455,10 @@ def _identify_adapter_params(model: nn.Module) -> set[str]:
             adapter_params.add(f"{name}.adapter.down_project.bias")
             adapter_params.add(f"{name}.adapter.up_project.weight")
             adapter_params.add(f"{name}.adapter.up_project.bias")
+
+    for key in model.state_dict():
+        if ".lora_A." in key or ".lora_B." in key:
+            adapter_params.add(key)
 
     return adapter_params
 

@@ -54,6 +54,15 @@ finetuning = [
 lowprec = [
     "torchao",
 ]
+unsloth = [
+    "unsloth",
+    "transformers",
+    "accelerate",
+    "peft",
+    "trl",
+    "datasets",
+    "bitsandbytes",
+]
 scoring = [
     "pyfaidx",
     "pandas",

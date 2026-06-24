@@ -22,6 +22,7 @@ from alphagenome_pytorch.extensions.finetuning.transfer import (
     count_trainable_params,
     prepare_for_transfer,
     remove_all_heads,
+    validate_locon_targets,
 )
 
 
@@ -36,6 +37,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=int, default=16)
     parser.add_argument("--lora-targets", default="q_proj,v_proj")
+    parser.add_argument(
+        "--mode",
+        choices=("lora", "lora+locon"),
+        default="lora",
+        help="Adapter mode to profile.",
+    )
+    parser.add_argument(
+        "--lora-backend",
+        choices=("native", "peft", "unsloth"),
+        default="native",
+        help="LoRA implementation to profile.",
+    )
+    parser.add_argument("--locon-rank", type=int, default=4)
+    parser.add_argument("--locon-alpha", type=int, default=1)
+    parser.add_argument(
+        "--locon-targets",
+        default="down_blocks.4,down_blocks.5",
+        help="Comma-separated Conv1d target patterns for lora+locon mode.",
+    )
     parser.add_argument(
         "--dtype",
         choices=(
@@ -53,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fp8-min-feature-multiple", type=int, default=16)
     parser.add_argument(
         "--fp8-skip-name-patterns",
-        default="heads,original_layer,lora_,locon_,ia3,adapter",
+        default="heads,original_layer,base_layer,lora_,locon_,ia3,adapter",
     )
     parser.add_argument("--fp4-min-feature-multiple", type=int, default=16)
     parser.add_argument("--fp4-mode", choices=("qat", "weight-only"), default="qat")
@@ -165,6 +185,7 @@ def main() -> None:
 
     resolutions = tuple(int(x) for x in args.resolutions.split(",") if x.strip())
     lora_targets = [x.strip() for x in args.lora_targets.split(",") if x.strip()]
+    locon_targets = [x.strip() for x in args.locon_targets.split(",") if x.strip()]
     dtype_policy = _dtype_policy_from_name(args.dtype)
 
     model = AlphaGenome(
@@ -172,13 +193,19 @@ def main() -> None:
         dtype_policy=dtype_policy,
     )
     model = remove_all_heads(model)
+    if args.mode == "lora+locon":
+        validate_locon_targets(model, locon_targets)
     model = prepare_for_transfer(
         model,
         TransferConfig(
-            mode="lora",
+            mode=args.mode if args.mode == "lora" else ["lora", "locon"],
             lora_rank=args.lora_rank,
             lora_alpha=args.lora_alpha,
             lora_targets=lora_targets,
+            lora_backend=args.lora_backend,
+            locon_rank=args.locon_rank,
+            locon_alpha=args.locon_alpha,
+            locon_targets=locon_targets,
             new_heads={
                 "atac": {
                     "modality": "atac",
@@ -233,7 +260,12 @@ def main() -> None:
     print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
     print(f"Resolutions: {resolutions}")
     print(f"LoRA rank/alpha: {args.lora_rank}/{args.lora_alpha}")
+    print(f"LoRA backend: {args.lora_backend}")
     print(f"LoRA targets: {lora_targets}")
+    print(f"Mode: {args.mode}")
+    if args.mode == "lora+locon":
+        print(f"Locon rank/alpha: {args.locon_rank}/{args.locon_alpha}")
+        print(f"Locon targets: {locon_targets}")
     print(f"Dtype policy: {dtype_policy}")
     print(f"Low precision conversion: {conversion_stats}")
     print(f"Gradient checkpointing: {args.gradient_checkpointing}")

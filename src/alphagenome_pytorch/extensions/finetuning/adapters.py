@@ -512,13 +512,72 @@ def _is_adapter_internal(name: str, parent: nn.Module) -> bool:
     multiple adapter types (e.g., LoRA + Houlsby on the same targets).
     """
     # Skip modules inside adapter wrappers (e.g., "q_proj.original_layer")
-    if ".original_layer" in name or ".adapter" in name:
+    if (
+        ".original_layer" in name
+        or ".base_layer" in name
+        or ".lora_A" in name
+        or ".lora_B" in name
+        or ".adapter" in name
+    ):
         return True
     # Skip if parent is already an adapter wrapper
     adapter_parents = (LoRA, Locon, IA3, IA3_FF, HoulsbyWrapper)
     if isinstance(parent, adapter_parents):
         return True
     return False
+
+
+def _ensure_unsloth_available() -> str:
+    """Import Unsloth so its runtime patches are active before PEFT injection."""
+    try:
+        import unsloth  # noqa: F401
+        from unsloth import FastLanguageModel  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "The Unsloth LoRA backend requires the optional Unsloth stack. "
+            "Install it with `uv pip install -e '.[unsloth]'` inside the "
+            "training environment."
+        ) from exc
+
+    return getattr(unsloth, "__version__", "unknown")
+
+
+def apply_hf_lora(
+    model: nn.Module,
+    target_modules: list[str],
+    rank: int = 8,
+    alpha: int = 16,
+    *,
+    backend: str = "peft",
+) -> nn.Module:
+    """Apply Hugging Face PEFT LoRA adapters to matching Linear layers.
+
+    ``backend="unsloth"`` imports Unsloth first so its PEFT/runtime patches are
+    available, then uses PEFT's generic adapter injection. AlphaGenome is not a
+    Hugging Face causal language model, so we deliberately do not call
+    ``FastLanguageModel.get_peft_model`` here.
+    """
+    if backend not in {"peft", "unsloth"}:
+        raise ValueError(f"Unsupported Hugging Face LoRA backend: {backend!r}")
+    if backend == "unsloth":
+        _ensure_unsloth_available()
+
+    try:
+        from peft import LoraConfig, inject_adapter_in_model
+    except ImportError as exc:
+        raise RuntimeError(
+            "The Hugging Face LoRA backend requires `peft`. Install the "
+            "optional dependencies with `uv pip install -e '.[unsloth]'`."
+        ) from exc
+
+    lora_config = LoraConfig(
+        r=rank,
+        lora_alpha=alpha,
+        target_modules=target_modules,
+        lora_dropout=0.0,
+        bias="none",
+    )
+    return inject_adapter_in_model(lora_config, model, adapter_name="default")
 
 
 def apply_lora(
@@ -841,12 +900,24 @@ def get_adapter_params(model: nn.Module) -> list:
     """
     adapter_types = (LoRA, Locon, IA3, IA3_FF, AdapterHoulsby, HoulsbyWrapper)
     params = []
+    seen: set[int] = set()
     
     for module in model.modules():
         if isinstance(module, adapter_types):
             for param in module.parameters():
-                if param.requires_grad:
+                if param.requires_grad and id(param) not in seen:
                     params.append(param)
+                    seen.add(id(param))
+
+    # Hugging Face PEFT/Unsloth LoRA injection leaves adapter parameters in
+    # modules whose parameter names include lora_A/lora_B rather than using the
+    # native wrapper classes above.
+    for name, param in model.named_parameters():
+        if not param.requires_grad or id(param) in seen:
+            continue
+        if ".lora_A." in name or ".lora_B." in name:
+            params.append(param)
+            seen.add(id(param))
     
     return params
 
@@ -886,6 +957,7 @@ __all__ = [
     'HoulsbyBlockWrapper',
     # Apply functions
     'apply_lora',
+    'apply_hf_lora',
     'apply_locon',
     'apply_ia3',
     'apply_houlsby',

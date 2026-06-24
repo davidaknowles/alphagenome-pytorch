@@ -96,6 +96,57 @@ python scripts/run_humanbraindev_lora_finetune.py \
   --pretrained-weights ../mpragent/outputs/models/alphagenome/model_all_folds.safetensors
 ```
 
+## Unsloth Follow-Up
+
+Unsloth was profiled in a separate environment because installing it selects a
+different HF/Torch stack than the original torchao runs:
+
+```bash
+source ~/venv/unsloth/bin/activate
+# torch==2.10.0+cu128, transformers==5.5.0, peft==0.19.1,
+# unsloth==2026.6.9, torchao==0.17.0
+```
+
+The profiler now supports `--lora-backend native|peft|unsloth` and
+`--mode lora+locon`. The Unsloth path imports Unsloth before PEFT adapter
+injection, then uses PEFT's generic LoRA injection for AlphaGenome's `nn.Module`
+and the existing native Locon implementation for Conv1d layers.
+
+### Unsloth Results
+
+Same synthetic setup as above: RTX PRO 6000 Blackwell, sequence length 131072,
+134 ATAC output tracks, resolutions `1,128`, LoRA rank 8/alpha 16 on
+`q_proj,v_proj`, one warmup step, three timed optimizer steps.
+
+| Config | Backend | Adapter mode | Microbatch x accum | Mean step (s) | Effective samples/s | bp/s | Peak allocated GiB | Peak reserved GiB | `nvidia-smi` max GiB |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Default | native | LoRA | 8 x 1 | 1.496 | 5.346 | 700,747 | 77.94 | 85.83 | 86.51 |
+| Default | unsloth | LoRA | 8 x 1 | 1.495 | 5.349 | 701,159 | 77.94 | 85.77 | 86.46 |
+| Default | native | LoRA+Locon | 8 x 1 | 1.546 | 5.176 | 678,443 | 80.44 | 88.37 | 89.06 |
+| Default | peft | LoRA+Locon | 8 x 1 | 1.526 | 5.241 | 686,936 | 80.44 | 88.37 | 89.06 |
+| Default | unsloth | LoRA+Locon | 8 x 1 | 1.525 | 5.245 | 687,410 | 80.44 | 88.37 | 89.06 |
+| Super Low VRAM (`nvfp4`) | native | LoRA+Locon | 1 x 8 | 3.015 | 2.654 | 347,831 | 5.11 | 6.73 | 7.42 |
+| Super Low VRAM (`nvfp4`) | unsloth | LoRA+Locon | 1 x 8 | 3.015 | 2.653 | 347,755 | 5.11 | 7.18 | 7.87 |
+
+Unsloth is ineffective for this AlphaGenome path: throughput and VRAM are
+within run-to-run noise of native/PEFT. The concrete debug finding is that after
+Unsloth import, the wrapped attention projections are still generic
+`peft.tuners.lora.layer.Linear` modules, not Unsloth-specialized modules. That
+matches the integration boundary: Unsloth's optimized public path is
+`FastLanguageModel`/Hugging Face Transformers models, while AlphaGenome is a
+custom PyTorch `nn.Module`.
+
+One bug did show up during the comparison: generic PEFT injection froze the
+new finetuning heads, leaving only LoRA/Locon trainable. The transfer path now
+re-enables `config.new_heads` after PEFT/Unsloth LoRA injection, and the
+profiler verifies the expected trainable parameter split:
+`heads=618,008`, `adapters=444,928` for LoRA+Locon.
+
+The practical recommendation is unchanged: use the native adapter path plus
+torchao low precision for AlphaGenome. `--lora-backend unsloth` is available for
+experiments, but it does not improve the current synthetic LoRA or LoRA+Locon
+profiles.
+
 ## Notes
 
 - The FP8 default is `tensorwise`. Torchao's rowwise/axiswise scaling is more
@@ -108,10 +159,7 @@ python scripts/run_humanbraindev_lora_finetune.py \
   higher-rank inputs compatible with the prototype implementation.
 - Low-precision AdamW state was verified by the profiler. The reported
   `bfloat16,float32` state means bf16 moment buffers plus fp32 step counters.
-- Unsloth was checked with `uv pip install --dry-run unsloth` and was not
-  installed into `~/venv/torch`: it would downgrade this environment from
-  `torch==2.12.1` to `torch==2.10.0`, replace CUDA bindings/Triton, and install
-  an HF/PEFT training stack. Its public integration path is for Hugging Face
-  Transformers/Sentence Transformers models, not this custom AlphaGenome
-  `nn.Module`, so using it here would require a separate model wrapper and would
-  invalidate the current torchao/Blackwell measurements.
+- Unsloth was installed into `~/venv/unsloth`, not `~/venv/torch`, because it
+  selects `torch==2.10.0` and a full HF/PEFT stack. In that environment torchao
+  prints `Skipping import of cpp extensions due to incompatible torch version`
+  but the NVFP4 QAT profile above still runs.

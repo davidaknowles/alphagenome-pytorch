@@ -75,6 +75,7 @@ def convert_linears_to_float8_training(
     skip_name_patterns: Iterable[str] = (
         "heads",
         "original_layer",
+        "base_layer",
         "lora_",
         "locon_",
         "ia3",
