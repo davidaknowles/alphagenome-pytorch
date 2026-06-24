@@ -62,6 +62,12 @@ def parse_args() -> argparse.Namespace:
         default="heads,lora_,locon_,ia3,adapter",
     )
     parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=1,
+        help="Accumulate this many microbatches before each optimizer step.",
+    )
     parser.add_argument("--warmup-steps", type=int, default=1)
     parser.add_argument("--timed-steps", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -223,6 +229,8 @@ def main() -> None:
     print(f"Device: {torch.cuda.get_device_name(device)}")
     print(f"Sequence length: {args.sequence_length}")
     print(f"Batch size: {args.batch_size}")
+    print(f"Gradient accumulation steps: {args.gradient_accumulation_steps}")
+    print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
     print(f"Resolutions: {resolutions}")
     print(f"LoRA rank/alpha: {args.lora_rank}/{args.lora_alpha}")
     print(f"LoRA targets: {lora_targets}")
@@ -237,30 +245,34 @@ def main() -> None:
 
     def step() -> float:
         optimizer.zero_grad(set_to_none=True)
-        sequences = _make_onehot(args.batch_size, args.sequence_length, device)
-        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-            outputs = model(
-                sequences,
-                organism_idx,
-                return_embeddings=True,
-                resolutions=resolutions,
-                channels_last=False,
-            )
-            embeddings = {
-                res: outputs[f"embeddings_{res}bp"]
-                for res in resolutions
-                if f"embeddings_{res}bp" in outputs
-            }
-            predictions = head(
-                embeddings,
-                organism_idx,
-                return_scaled=True,
-                channels_last=True,
-            )
-            loss = sum(pred.float().mean() for pred in predictions.values())
-        loss.backward()
+        total_loss = 0.0
+        for _ in range(args.gradient_accumulation_steps):
+            sequences = _make_onehot(args.batch_size, args.sequence_length, device)
+            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                outputs = model(
+                    sequences,
+                    organism_idx,
+                    return_embeddings=True,
+                    resolutions=resolutions,
+                    channels_last=False,
+                )
+                embeddings = {
+                    res: outputs[f"embeddings_{res}bp"]
+                    for res in resolutions
+                    if f"embeddings_{res}bp" in outputs
+                }
+                predictions = head(
+                    embeddings,
+                    organism_idx,
+                    return_scaled=True,
+                    channels_last=True,
+                )
+                loss = sum(pred.float().mean() for pred in predictions.values())
+                scaled_loss = loss / args.gradient_accumulation_steps
+            scaled_loss.backward()
+            total_loss += float(loss.detach().cpu())
         optimizer.step()
-        return float(loss.detach().cpu())
+        return total_loss / args.gradient_accumulation_steps
 
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
@@ -284,8 +296,9 @@ def main() -> None:
     peak_allocated = torch.cuda.max_memory_allocated(device) / 1024**3
     peak_reserved = torch.cuda.max_memory_reserved(device) / 1024**3
     mean_step = sum(timings) / len(timings)
-    samples_per_second = args.batch_size / mean_step
-    tokens_per_second = args.batch_size * args.sequence_length / mean_step
+    effective_batch_size = args.batch_size * args.gradient_accumulation_steps
+    samples_per_second = effective_batch_size / mean_step
+    tokens_per_second = effective_batch_size * args.sequence_length / mean_step
 
     print("Results:")
     print(f"  loss: {loss:.6f}")

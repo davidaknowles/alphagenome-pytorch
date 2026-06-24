@@ -34,6 +34,7 @@ cmd=(
   --window-size "${WINDOW_SIZE:-131072}"
   --stride "${STRIDE:-131072}"
   --batch-size "${BATCH_SIZE:-7}"
+  --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS:-1}"
   --epochs "${EPOCHS:-5}"
   --lr "${LR:-1e-4}"
   --weight-decay "${WEIGHT_DECAY:-0.1}"

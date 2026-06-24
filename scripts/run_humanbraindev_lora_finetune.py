@@ -149,6 +149,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-test", type=_positive_int_or_none, default=None)
     parser.add_argument("--limit-bigwigs", type=_positive_int_or_none, default=None)
     parser.add_argument("--batch-size", type=int, default=7)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.1)
@@ -274,6 +275,8 @@ def main() -> None:
         str(args.epochs),
         "--batch-size",
         str(args.batch_size),
+        "--gradient-accumulation-steps",
+        str(args.gradient_accumulation_steps),
         "--lr",
         str(args.lr),
         "--weight-decay",
