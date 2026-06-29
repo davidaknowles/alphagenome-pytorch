@@ -519,11 +519,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     model.add_argument(
         "--fp4-mode",
         choices=["qat", "weight-only"],
-        default="qat",
+        default="weight-only",
         help=(
-            "NVFP4 backend mode. qat uses torchao's training-oriented fake "
-            "quantized Linear path; weight-only uses compact NVFP4 frozen "
-            "weights and is experimental for this model."
+            "NVFP4 backend mode. weight-only uses compact torchao NVFP4 frozen "
+            "weights for the base model. qat uses torchao's training-oriented "
+            "fake-quantized Linear path, but currently requires a newer "
+            "Torch/TorchAO stack than the CUDA 12.4 nodes provide."
         ),
     )
     model.add_argument(

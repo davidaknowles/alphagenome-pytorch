@@ -47,7 +47,7 @@ cmd=(
   --fp8-min-feature-multiple "${FP8_MIN_FEATURE_MULTIPLE:-16}"
   --fp8-skip-name-patterns "${FP8_SKIP_NAME_PATTERNS:-heads,original_layer,lora_,locon_,ia3,adapter}"
   --fp4-min-feature-multiple "${FP4_MIN_FEATURE_MULTIPLE:-16}"
-  --fp4-mode "${FP4_MODE:-qat}"
+  --fp4-mode "${FP4_MODE:-weight-only}"
   --fp4-skip-name-patterns "${FP4_SKIP_NAME_PATTERNS:-heads,lora_,locon_,ia3,adapter}"
   --track-means-samples "${TRACK_MEANS_SAMPLES:-256}"
   --num-workers "${NUM_WORKERS:-4}"

@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
         default="heads,original_layer,lora_,locon_,ia3,adapter",
     )
     parser.add_argument("--fp4-min-feature-multiple", type=int, default=16)
-    parser.add_argument("--fp4-mode", choices=("qat", "weight-only"), default="qat")
+    parser.add_argument("--fp4-mode", choices=("qat", "weight-only"), default="weight-only")
     parser.add_argument(
         "--fp4-skip-name-patterns",
         default="heads,lora_,locon_,ia3,adapter",

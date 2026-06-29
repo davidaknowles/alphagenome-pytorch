@@ -7,6 +7,7 @@ from typing import Iterable
 
 import torch
 import torch.nn as nn
+from packaging.version import Version
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,23 @@ def _wrap_modules_by_class_name(model: nn.Module, class_name: str) -> int:
     wrapped = 0
     for fqn, module in list(named_modules.items()):
         if fqn == "" or module.__class__.__name__ != class_name:
+            continue
+        child_name = fqn.split(".")[-1]
+        parent_fqn = fqn.removesuffix(child_name).removesuffix(".")
+        parent = named_modules[parent_fqn]
+        setattr(parent, child_name, _ContiguousInputWrapper(module))
+        wrapped += 1
+    return wrapped
+
+
+def _wrap_linears_by_weight_class_name(model: nn.Module, class_name: str) -> int:
+    named_modules = dict(model.named_modules())
+    wrapped = 0
+    for fqn, module in list(named_modules.items()):
+        if fqn == "" or not isinstance(module, nn.Linear):
+            continue
+        weight = getattr(module, "weight", None)
+        if weight is None or weight.__class__.__name__ != class_name:
             continue
         child_name = fqn.split(".")[-1]
         parent_fqn = fqn.removesuffix(child_name).removesuffix(".")
@@ -185,6 +203,7 @@ def convert_linears_to_nvfp4_weight_only(
         ),
         filter_fn=module_filter_fn,
     )
+    _wrap_linears_by_weight_class_name(model, "NVFP4Tensor")
 
     converted = sum(1 for selected in decisions.values() if selected)
     skipped = sum(1 for selected in decisions.values() if not selected)
@@ -216,6 +235,7 @@ def convert_linears_to_nvfp4_qat_training(
         raise ValueError("min_feature_multiple must be >= 1")
 
     try:
+        import torchao
         from torchao.prototype.mx_formats import NVFP4DynamicActivationNVFP4WeightConfig
         from torchao.quantization import quantize_
         from torchao.quantization.qat import QATConfig
@@ -224,6 +244,15 @@ def convert_linears_to_nvfp4_qat_training(
             "torchao is required for --dtype nvfp4. Install the optional low "
             "precision dependencies with `uv pip install -e '.[lowprec]'`."
         ) from exc
+    torchao_version = Version(str(getattr(torchao, "__version__", "0")).split("+", 1)[0])
+    torch_version = Version(str(torch.__version__).split("+", 1)[0])
+    if torchao_version < Version("0.18.0") and torch_version < Version("2.11.0"):
+        raise RuntimeError(
+            "torchao NVFP4 QAT currently fails on CUDA with torchao<0.18 and "
+            "torch<2.11 (`Float4_e2m1fn_x2` cannot be converted to a CUDA dtype). "
+            "Use --fp4-mode weight-only for frozen-base LoRA/LoCon runs, or use a "
+            "Torch/TorchAO stack where NVFP4 QAT is supported."
+        )
 
     patterns = tuple(skip_name_patterns)
     decisions: dict[str, bool] = {}
