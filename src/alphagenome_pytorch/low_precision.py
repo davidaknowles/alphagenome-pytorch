@@ -20,6 +20,7 @@ class Float8ConversionStats:
     skipped_linears: int
     min_feature_multiple: int
     skipped_name_patterns: tuple[str, ...]
+    include_name_patterns: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -32,10 +33,17 @@ class Float4ConversionStats:
     skipped_linears: int
     min_feature_multiple: int
     skipped_name_patterns: tuple[str, ...]
+    include_name_patterns: tuple[str, ...] = ()
+    quant_type: str | None = None
 
 
 def _matches_any_pattern(name: str, patterns: Iterable[str]) -> bool:
     return any(pattern and pattern in name for pattern in patterns)
+
+
+def _matches_include_patterns(name: str, patterns: Iterable[str]) -> bool:
+    patterns = tuple(patterns)
+    return not patterns or _matches_any_pattern(name, patterns)
 
 
 class _ContiguousInputWrapper(nn.Module):
@@ -98,6 +106,7 @@ def convert_linears_to_float8_training(
         "ia3",
         "adapter",
     ),
+    include_name_patterns: Iterable[str] = (),
 ) -> Float8ConversionStats:
     """Convert eligible ``nn.Linear`` modules to torchao Float8Linear.
 
@@ -123,6 +132,7 @@ def convert_linears_to_float8_training(
         ) from exc
 
     patterns = tuple(skip_name_patterns)
+    include_patterns = tuple(include_name_patterns)
     decisions: dict[str, bool] = {}
 
     def module_filter_fn(mod: nn.Module, fqn: str) -> bool:
@@ -130,6 +140,7 @@ def convert_linears_to_float8_training(
             isinstance(mod, nn.Linear)
             and mod.in_features % min_feature_multiple == 0
             and mod.out_features % min_feature_multiple == 0
+            and _matches_include_patterns(fqn, include_patterns)
             and not _matches_any_pattern(fqn, patterns)
         )
         if isinstance(mod, nn.Linear):
@@ -152,6 +163,7 @@ def convert_linears_to_float8_training(
         skipped_linears=skipped,
         min_feature_multiple=min_feature_multiple,
         skipped_name_patterns=patterns,
+        include_name_patterns=include_patterns,
     )
 
 
@@ -160,6 +172,7 @@ def convert_linears_to_nvfp4_weight_only(
     *,
     min_feature_multiple: int = 16,
     skip_name_patterns: Iterable[str] = ("heads", "lora_", "locon_", "ia3", "adapter"),
+    include_name_patterns: Iterable[str] = (),
     use_dynamic_per_tensor_scale: bool = True,
 ) -> Float4ConversionStats:
     """Convert eligible frozen ``nn.Linear`` weights to torchao NVFP4 tensors.
@@ -182,6 +195,7 @@ def convert_linears_to_nvfp4_weight_only(
         ) from exc
 
     patterns = tuple(skip_name_patterns)
+    include_patterns = tuple(include_name_patterns)
     decisions: dict[str, bool] = {}
 
     def module_filter_fn(mod: nn.Module, fqn: str) -> bool:
@@ -190,6 +204,7 @@ def convert_linears_to_nvfp4_weight_only(
             and mod.in_features % min_feature_multiple == 0
             and mod.out_features % min_feature_multiple == 0
             and not mod.weight.requires_grad
+            and _matches_include_patterns(fqn, include_patterns)
             and not _matches_any_pattern(fqn, patterns)
         )
         if isinstance(mod, nn.Linear):
@@ -214,6 +229,8 @@ def convert_linears_to_nvfp4_weight_only(
         skipped_linears=skipped,
         min_feature_multiple=min_feature_multiple,
         skipped_name_patterns=patterns,
+        include_name_patterns=include_patterns,
+        quant_type="nvfp4",
     )
 
 
@@ -222,6 +239,7 @@ def convert_linears_to_nvfp4_qat_training(
     *,
     min_feature_multiple: int = 16,
     skip_name_patterns: Iterable[str] = ("heads", "lora_", "locon_", "ia3", "adapter"),
+    include_name_patterns: Iterable[str] = (),
     use_triton_kernel: bool = False,
 ) -> Float4ConversionStats:
     """Convert eligible ``nn.Linear`` modules to torchao NVFP4 QAT linears.
@@ -255,6 +273,7 @@ def convert_linears_to_nvfp4_qat_training(
         )
 
     patterns = tuple(skip_name_patterns)
+    include_patterns = tuple(include_name_patterns)
     decisions: dict[str, bool] = {}
 
     def module_filter_fn(mod: nn.Module, fqn: str) -> bool:
@@ -262,6 +281,7 @@ def convert_linears_to_nvfp4_qat_training(
             isinstance(mod, nn.Linear)
             and mod.in_features % min_feature_multiple == 0
             and mod.out_features % min_feature_multiple == 0
+            and _matches_include_patterns(fqn, include_patterns)
             and not _matches_any_pattern(fqn, patterns)
         )
         if isinstance(mod, nn.Linear):
@@ -287,4 +307,79 @@ def convert_linears_to_nvfp4_qat_training(
         skipped_linears=skipped,
         min_feature_multiple=min_feature_multiple,
         skipped_name_patterns=patterns,
+        include_name_patterns=include_patterns,
+        quant_type="nvfp4",
+    )
+
+
+def convert_linears_to_bnb_nf4_weight_only(
+    model: nn.Module,
+    *,
+    compute_dtype: torch.dtype = torch.bfloat16,
+    min_feature_multiple: int = 16,
+    skip_name_patterns: Iterable[str] = ("heads", "lora_", "locon_", "ia3", "adapter"),
+    include_name_patterns: Iterable[str] = (),
+) -> Float4ConversionStats:
+    """Replace eligible frozen ``nn.Linear`` modules with bitsandbytes NF4 linears."""
+    if min_feature_multiple < 1:
+        raise ValueError("min_feature_multiple must be >= 1")
+    try:
+        import bitsandbytes as bnb
+    except ImportError as exc:
+        raise RuntimeError(
+            "bitsandbytes is required for --dtype nf4. Install it in the active "
+            "PyTorch environment, e.g. `pip install bitsandbytes`."
+        ) from exc
+
+    patterns = tuple(skip_name_patterns)
+    include_patterns = tuple(include_name_patterns)
+    named_modules = dict(model.named_modules())
+    decisions: dict[str, bool] = {}
+    replacements: list[tuple[str, nn.Module]] = []
+
+    for fqn, module in list(named_modules.items()):
+        if fqn == "" or not isinstance(module, nn.Linear):
+            continue
+        eligible = (
+            module.in_features % min_feature_multiple == 0
+            and module.out_features % min_feature_multiple == 0
+            and not module.weight.requires_grad
+            and _matches_include_patterns(fqn, include_patterns)
+            and not _matches_any_pattern(fqn, patterns)
+        )
+        decisions[fqn] = eligible
+        if not eligible:
+            continue
+        quantized = bnb.nn.Linear4bit(
+            module.in_features,
+            module.out_features,
+            bias=module.bias is not None,
+            compute_dtype=compute_dtype,
+            quant_type="nf4",
+            quant_storage=torch.uint8,
+        )
+        quantized.load_state_dict(module.state_dict(), strict=True)
+        quantized.train(module.training)
+        quantized = quantized.to(device=module.weight.device)
+        for param in quantized.parameters():
+            param.requires_grad_(False)
+        replacements.append((fqn, quantized))
+
+    for fqn, quantized in replacements:
+        child_name = fqn.split(".")[-1]
+        parent_fqn = fqn.removesuffix(child_name).removesuffix(".")
+        parent = named_modules[parent_fqn]
+        setattr(parent, child_name, quantized)
+
+    converted = sum(1 for selected in decisions.values() if selected)
+    skipped = sum(1 for selected in decisions.values() if not selected)
+    return Float4ConversionStats(
+        backend="bitsandbytes",
+        mode="weight_only",
+        converted_linears=converted,
+        skipped_linears=skipped,
+        min_feature_multiple=min_feature_multiple,
+        skipped_name_patterns=patterns,
+        include_name_patterns=include_patterns,
+        quant_type="nf4",
     )

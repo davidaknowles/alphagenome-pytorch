@@ -71,6 +71,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -95,6 +96,7 @@ from alphagenome_pytorch.config import DtypePolicy
 from alphagenome_pytorch.low_precision import (
     Float4ConversionStats,
     Float8ConversionStats,
+    convert_linears_to_bnb_nf4_weight_only,
     convert_linears_to_nvfp4_qat_training,
     convert_linears_to_nvfp4_weight_only,
     convert_linears_to_float8_training,
@@ -464,6 +466,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "float16-params",
             "nvfp8",
             "nvfp4",
+            "nf4",
         ],
         help=(
             "Precision preset. bfloat16/float16 keep parameters in float32 and "
@@ -471,7 +474,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "16-bit dtype. nvfp8 stores parameters in bfloat16 and converts "
             "eligible Linear layers to torchao Float8Linear training kernels. "
             "nvfp4 stores trainable params in bfloat16 and converts eligible "
-            "frozen base Linear weights to torchao NVFP4 tensors."
+            "frozen base Linear weights to torchao NVFP4 tensors. nf4 uses "
+            "bitsandbytes Linear4bit NF4 modules for eligible frozen Linear weights."
         ),
     )
     model.add_argument(
@@ -511,6 +515,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     model.add_argument(
+        "--fp8-include-name-patterns",
+        type=str,
+        default="",
+        help="Comma-separated fully-qualified-name substrings to include in torchao float8 conversion.",
+    )
+    model.add_argument(
         "--fp4-min-feature-multiple",
         type=int,
         default=16,
@@ -535,6 +545,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Comma-separated fully-qualified-name substrings to exclude from "
             "torchao NVFP4 weight conversion."
         ),
+    )
+    model.add_argument(
+        "--fp4-include-name-patterns",
+        type=str,
+        default="",
+        help="Comma-separated fully-qualified-name substrings to include in torchao NVFP4 conversion.",
+    )
+    model.add_argument(
+        "--nf4-min-feature-multiple",
+        type=int,
+        default=16,
+        help="Only convert NF4 Linear layers whose input/output features are divisible by this value.",
+    )
+    model.add_argument(
+        "--nf4-skip-name-patterns",
+        type=str,
+        default="heads,original_layer,lora_,locon_,ia3,adapter",
+        help="Comma-separated fully-qualified-name substrings to exclude from bitsandbytes NF4 conversion.",
+    )
+    model.add_argument(
+        "--nf4-include-name-patterns",
+        type=str,
+        default="",
+        help="Comma-separated fully-qualified-name substrings to include in bitsandbytes NF4 conversion.",
     )
     model.add_argument(
         "--head-init-scheme",
@@ -575,6 +609,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     train.add_argument("--profile-batches", type=int, default=0, help="Profile first N batches")
     train.add_argument("--compile", action="store_true", help="Use torch.compile")
     train.add_argument("--seed", type=int, default=None, help="Random seed")
+    train.add_argument("--best-metric", type=str, default="valid_loss")
+    train.add_argument("--best-metric-mode", choices=("min", "max"), default="min")
+    train.add_argument("--early-stopping-patience", type=int, default=0)
+    train.add_argument("--early-stopping-min-delta", type=float, default=0.0)
 
     # Distributed/Sequence Parallel arguments
     dist = parser.add_argument_group("Distributed")
@@ -595,6 +633,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     log.add_argument("--wandb", action="store_true", help="Enable W&B logging")
     log.add_argument("--wandb-project", type=str, default=DEFAULTS["wandb_project"])
     log.add_argument("--wandb-entity", type=str, default=None)
+    log.add_argument("--wandb-group", type=str, default=None)
+    log.add_argument("--wandb-tags", type=str, default=None, help="Comma-separated W&B tags")
+    log.add_argument("--wandb-job-type", type=str, default=None)
+    log.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default=None)
+    log.add_argument(
+        "--run-metadata",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Additional scalar metadata to include in saved config and W&B config.",
+    )
     log.add_argument("--log-every", type=int, default=DEFAULTS["log_every"])
 
     # Output arguments
@@ -756,9 +805,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "profile_batches",
         "compile",
         "seed",
+        "best_metric",
+        "best_metric_mode",
+        "early_stopping_patience",
+        "early_stopping_min_delta",
         "wandb",
         "wandb_project",
         "wandb_entity",
+        "wandb_group",
+        "wandb_tags",
+        "wandb_job_type",
+        "wandb_mode",
+        "run_metadata",
         "log_every",
         "output_dir",
         "run_name",
@@ -1206,6 +1264,13 @@ def create_model(
             "storage/compute with torchao NVFP4 frozen-weight conversion.",
             rank,
         )
+    elif args.dtype == "nf4":
+        dtype_policy = DtypePolicy.aggressive_bfloat16()
+        print_rank0(
+            "nf4 preset selected: using bfloat16 trainable parameter "
+            "storage/compute with bitsandbytes NF4 frozen-weight conversion.",
+            rank,
+        )
     else:
         dtype_policy = DtypePolicy.mixed_precision()
     print_rank0(f"Dtype policy: {dtype_policy}", rank)
@@ -1372,11 +1437,17 @@ def create_model(
             for pattern in args.fp8_skip_name_patterns.split(",")
             if pattern.strip()
         )
+        fp8_include_name_patterns = tuple(
+            pattern.strip()
+            for pattern in args.fp8_include_name_patterns.split(",")
+            if pattern.strip()
+        )
         fp8_stats = convert_linears_to_float8_training(
             model,
             recipe=args.fp8_recipe,
             min_feature_multiple=args.fp8_min_feature_multiple,
             skip_name_patterns=fp8_skip_name_patterns,
+            include_name_patterns=fp8_include_name_patterns,
         )
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         print_rank0(
@@ -1393,19 +1464,52 @@ def create_model(
             for pattern in args.fp4_skip_name_patterns.split(",")
             if pattern.strip()
         )
+        fp4_include_name_patterns = tuple(
+            pattern.strip()
+            for pattern in args.fp4_include_name_patterns.split(",")
+            if pattern.strip()
+        )
         fp4_stats = convert_linears_to_nvfp4_weight_only(
             model,
             min_feature_multiple=args.fp4_min_feature_multiple,
             skip_name_patterns=fp4_skip_name_patterns,
+            include_name_patterns=fp4_include_name_patterns,
         ) if args.fp4_mode == "weight-only" else convert_linears_to_nvfp4_qat_training(
             model,
             min_feature_multiple=args.fp4_min_feature_multiple,
             skip_name_patterns=fp4_skip_name_patterns,
+            include_name_patterns=fp4_include_name_patterns,
         )
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         print_rank0(
             "torchao NVFP4 conversion: "
             f"mode={fp4_stats.mode}, "
+            f"converted={fp4_stats.converted_linears}, "
+            f"skipped={fp4_stats.skipped_linears}, "
+            f"min_feature_multiple={fp4_stats.min_feature_multiple}",
+            rank,
+        )
+    elif args.dtype == "nf4":
+        nf4_skip_name_patterns = tuple(
+            pattern.strip()
+            for pattern in args.nf4_skip_name_patterns.split(",")
+            if pattern.strip()
+        )
+        nf4_include_name_patterns = tuple(
+            pattern.strip()
+            for pattern in args.nf4_include_name_patterns.split(",")
+            if pattern.strip()
+        )
+        fp4_stats = convert_linears_to_bnb_nf4_weight_only(
+            model,
+            compute_dtype=dtype_policy.compute_dtype,
+            min_feature_multiple=args.nf4_min_feature_multiple,
+            skip_name_patterns=nf4_skip_name_patterns,
+            include_name_patterns=nf4_include_name_patterns,
+        )
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        print_rank0(
+            "bitsandbytes NF4 conversion: "
             f"converted={fp4_stats.converted_linears}, "
             f"skipped={fp4_stats.skipped_linears}, "
             f"min_feature_multiple={fp4_stats.min_feature_multiple}",
@@ -1602,6 +1706,8 @@ def main(args: argparse.Namespace | None = None) -> None:
     # Resume from checkpoint
     start_epoch = 1
     best_val_loss = float("inf")
+    best_metric_value = None
+    epochs_since_improvement = 0
     wandb_run_id = None
 
     if resume_path and resume_path.exists():
@@ -1637,6 +1743,19 @@ def main(args: argparse.Namespace | None = None) -> None:
             print_rank0(f"  Resumed at epoch {start_epoch}, best_val_loss={best_val_loss:.4f}", rank)
 
     # Config for logging
+    run_metadata = {}
+    for item in args.run_metadata:
+        if "=" not in item:
+            raise ValueError(f"--run-metadata must be KEY=VALUE, got {item!r}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"--run-metadata key cannot be empty: {item!r}")
+        try:
+            run_metadata[key] = json.loads(value)
+        except json.JSONDecodeError:
+            run_metadata[key] = value
+
     config = {
         "mode": args.mode,
         "genome": args.genome,
@@ -1681,8 +1800,42 @@ def main(args: argparse.Namespace | None = None) -> None:
         "fp4": fp4_stats.__dict__ if fp4_stats is not None else None,
         "world_size": world_size,
         "seed": args.seed,
+        "best_metric": args.best_metric,
+        "best_metric_mode": args.best_metric_mode,
+        "early_stopping_patience": args.early_stopping_patience,
+        "early_stopping_min_delta": args.early_stopping_min_delta,
         "resumed_from": str(resume_path) if resume_path else None,
     }
+    config.update(run_metadata)
+    wandb_tags = tuple(item.strip() for item in (args.wandb_tags or "").split(",") if item.strip())
+
+    def resolve_best_metric(val_loss: float, val_metrics: dict[str, Any]) -> tuple[str, float | None]:
+        metric_name = args.best_metric
+        if metric_name in {"valid", "val", "valid_loss", "val_loss"}:
+            return "valid_loss", val_loss
+        for prefix in ("valid_", "val_"):
+            if metric_name.startswith(prefix):
+                key = metric_name.removeprefix(prefix)
+                if key in val_metrics:
+                    return key, float(val_metrics[key])
+                if key == "differential_pearson_r":
+                    matches = [
+                        value
+                        for name, value in val_metrics.items()
+                        if name.endswith("_128bp_differential_pearson_r")
+                    ]
+                    if len(matches) == 1:
+                        return key, float(matches[0])
+        if metric_name in val_metrics:
+            return metric_name, float(val_metrics[metric_name])
+        return metric_name, None
+
+    def is_metric_improved(current: float, best: float | None) -> bool:
+        if best is None:
+            return True
+        if args.best_metric_mode == "max":
+            return current > best + args.early_stopping_min_delta
+        return current < best - args.early_stopping_min_delta
 
     # Logger (rank 0 only)
     logger = TrainingLogger(
@@ -1692,6 +1845,10 @@ def main(args: argparse.Namespace | None = None) -> None:
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         run_name=run_name,
+        wandb_group=args.wandb_group,
+        wandb_tags=wandb_tags,
+        wandb_job_type=args.wandb_job_type,
+        wandb_mode=args.wandb_mode,
         config=config,
         resume_id=wandb_run_id if resume_path else None,
     )
@@ -1870,7 +2027,17 @@ def main(args: argparse.Namespace | None = None) -> None:
                 torch.cuda.synchronize()
 
             current_lr = scheduler.get_last_lr()[0]
-            is_best = val_loss < best_val_loss
+            best_metric_label, current_best_metric = resolve_best_metric(val_loss, val_metrics)
+            is_best = (
+                current_best_metric is not None
+                and is_metric_improved(current_best_metric, best_metric_value)
+            )
+            if is_best:
+                best_metric_value = current_best_metric
+                best_val_loss = val_loss
+                epochs_since_improvement = 0
+            else:
+                epochs_since_improvement += 1
 
             # Print epoch summary
             if is_main_process(rank):
@@ -1883,18 +2050,30 @@ def main(args: argparse.Namespace | None = None) -> None:
                         continue
                     if "pearson" in key or "_loss" in key:
                         summary += f", {key}={val:.4f}"
+                if current_best_metric is not None:
+                    summary += f", best_metric={best_metric_label}:{current_best_metric:.4f}"
                 print(summary)
 
             # Log epoch
             extra = {}
             histograms = {}
+            differential_metric_keys = [
+                key
+                for key in val_metrics
+                if key.endswith("_128bp_differential_pearson_r")
+            ]
             for key, val in val_metrics.items():
                 if key.endswith("_values"):
                     histograms[key] = val
+                elif key.endswith("_128bp_differential_pearson_r") and len(differential_metric_keys) == 1:
+                    extra["valid_differential_pearson_r"] = val
                 elif "pearson" in key:
                     extra[key] = val
                 else:
                     extra[f"val_loss_{key}"] = val
+            if current_best_metric is not None:
+                extra["best_metric_value"] = current_best_metric
+                extra["best_metric_name"] = best_metric_label
 
             logger.log_epoch(epoch, train_loss, val_loss, current_lr, is_best, extra, histograms)
 
@@ -1907,7 +2086,6 @@ def main(args: argparse.Namespace | None = None) -> None:
                 write_full = not args.no_full_checkpoint
 
                 if is_best:
-                    best_val_loss = val_loss
                     if write_full:
                         save_checkpoint(
                             path=output_dir / "best_model.pth",
@@ -1923,7 +2101,7 @@ def main(args: argparse.Namespace | None = None) -> None:
                             wandb_run_id=logger.wandb_run_id,
                             **transfer_config_kwargs,
                         )
-                        print(f"  Saved best model (val_loss={val_loss:.4f})")
+                        print(f"  Saved best model ({best_metric_label}={current_best_metric:.4f})")
                     if write_delta:
                         save_delta_checkpoint(
                             path=output_dir / "best_model.delta.pth",
@@ -1939,7 +2117,10 @@ def main(args: argparse.Namespace | None = None) -> None:
                             resolutions=modality_resolutions,
                             wandb_run_id=logger.wandb_run_id,
                         )
-                        print(f"  Saved best delta checkpoint (val_loss={val_loss:.4f})")
+                        print(
+                            f"  Saved best delta checkpoint "
+                            f"({best_metric_label}={current_best_metric:.4f})"
+                        )
 
                 if epoch % args.save_every == 0:
                     if write_full:
@@ -1974,6 +2155,17 @@ def main(args: argparse.Namespace | None = None) -> None:
                         )
 
             barrier()
+            if (
+                args.early_stopping_patience > 0
+                and epochs_since_improvement >= args.early_stopping_patience
+            ):
+                print_rank0(
+                    "Early stopping: "
+                    f"{epochs_since_improvement} epoch(s) without improvement in "
+                    f"{best_metric_label}.",
+                    rank,
+                )
+                break
 
     except KeyboardInterrupt:
         print_rank0("\nTraining interrupted by user", rank)
@@ -1984,14 +2176,19 @@ def main(args: argparse.Namespace | None = None) -> None:
 
     # Export transfer config if requested
     if args.export_transfer_config and transfer_config is not None and is_main_process(rank):
-        import json
         config_path = Path(args.export_transfer_config)
         config_path.parent.mkdir(parents=True, exist_ok=True)
         with open(config_path, "w") as f:
             json.dump(transfer_config_to_dict(transfer_config), f, indent=2)
         print(f"Exported TransferConfig to {config_path}")
 
-    print_rank0(f"\nTraining complete! Best val_loss: {best_val_loss:.4f}", rank)
+    if best_metric_value is None:
+        print_rank0(f"\nTraining complete! Best {args.best_metric}: unavailable", rank)
+    else:
+        print_rank0(
+            f"\nTraining complete! Best {args.best_metric}: {best_metric_value:.4f}",
+            rank,
+        )
     print_rank0(f"Output: {output_dir}", rank)
 
 
