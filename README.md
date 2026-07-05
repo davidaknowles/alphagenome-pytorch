@@ -1,5 +1,15 @@
 # AlphaGenome PyTorch
 
+## Overview
+
+This branch is focused on low-VRAM inference for AlphaGenome in PyTorch: bf16
+parameter casting, materialized effective convolution weights, Triton int8
+Conv1d kernels, encoder memory fusions, and alternative attention backends for
+131 kb and 1 Mb inference. It is based on the upstream PyTorch port at
+https://github.com/genomicsxai/alphagenome-pytorch; use that repository for the
+general-purpose package unless you specifically need the low-VRAM inference
+pipeline developed here.
+
 [![PyPI](https://img.shields.io/pypi/v/alphagenome-pytorch)](https://pypi.org/project/alphagenome-pytorch/)
 [![Documentation](https://readthedocs.org/projects/alphagenome-pytorch/badge/?version=latest)](https://alphagenome-pytorch.readthedocs.io)
 [![Weights](https://img.shields.io/badge/%F0%9F%A4%97-Weights-yellow)](https://huggingface.co/gtca/alphagenome_pytorch)
@@ -26,6 +36,12 @@ For fine-tuning (incl. BigWig data loading):
 
 ```bash
 pip install alphagenome-pytorch[finetuning]  # adds pyBigWig, pyfaidx
+```
+
+For the low-VRAM inference benchmark and runtime transforms:
+
+```bash
+pip install alphagenome-pytorch[low-vram]
 ```
 
 ## Quick Start

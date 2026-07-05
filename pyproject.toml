@@ -46,8 +46,9 @@ inference = [
     "tqdm",
 ]
 low-vram = [
+    "torch>=2.5.0",
     "pyfaidx",
-    "triton",
+    "triton>=3.0.0",
 ]
 finetuning = [
     "pybigwig",
@@ -56,6 +57,7 @@ finetuning = [
     "pyfaidx",
 ]
 lowprec = [
+    "bitsandbytes",
     "torchao",
 ]
 scoring = [
