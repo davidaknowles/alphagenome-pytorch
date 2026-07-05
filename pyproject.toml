@@ -45,6 +45,10 @@ inference = [
     "pyfaidx",
     "tqdm",
 ]
+low-vram = [
+    "pyfaidx",
+    "triton",
+]
 finetuning = [
     "pybigwig",
     "pandas",

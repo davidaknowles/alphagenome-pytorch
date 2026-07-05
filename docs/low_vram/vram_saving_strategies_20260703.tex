@@ -1,0 +1,257 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+
+\newcommand{\cmark}{\checkmark}
+
+\title{Memory-Efficient Torch Inference for AlphaGenome}
+\author{}
+\date{July 3, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We evaluated low-VRAM Torch inference strategies for AlphaGenome on a recreated
+human brain development ATAC checkpoint. At 131 kb and batch size 32, the
+lowest-memory configuration reduced observed peak memory from 90.46 GiB to
+24.59 GiB, with test \(r\) changing from 0.80891 to 0.80860. At 1 Mb and batch
+size 2, default inference exceeded 48 GiB, whereas the low-resolution-bias
+all-features configuration used 11.58 GiB.
+\end{abstract}
+
+\section{Experimental setup}
+
+All experiments used the recreated merged Torch checkpoint from the best
+LoRA+LoCon finetuning run. We evaluated the human brain development ATAC head
+at resolution 128 on full valid and test splits. For 131 kb input windows,
+batch size was 32 and the evaluation contained 2162 examples. For 1 Mb input
+windows, a valid/test-only target cache was built, batch size was 2, and the
+evaluation contained 269 examples. Peak device memory was sampled with
+\texttt{nvidia-smi} and is reported as GiB. Accuracy is reported as test
+differential Pearson. Throughput is reported as examples per second over the
+full valid/test evaluation.
+
+\section{Implementation details}
+
+\paragraph{Bfloat16 policy.}
+The \texttt{bf16\_params} path uses the Torch model's aggressive bfloat16 dtype
+policy for inference. Floating-point model state and persistent activations are
+stored or cast to bfloat16 where supported by the Torch implementation, while
+integer inputs and indexing tensors are unchanged.
+
+\paragraph{Effective standardized convolutions.}
+AlphaGenome standardizes convolution weights at every forward pass. For an
+output channel, the effective inference weight is
+\[
+  W_{\mathrm{eff}} =
+  (W - \mathrm{mean}(W))\,
+  \mathrm{rsqrt}\left(\max(\mathrm{var}(W)\,\mathrm{fan\_in}, 10^{-4})\right)\,
+  s,
+\]
+where \(s\) is the learned scale. The \texttt{\_stdconv\_effective} path
+materializes \(W_{\mathrm{eff}}\) once and replaces the module with a direct
+convolution that preserves AlphaGenome SAME padding. This avoids runtime weight
+standardization and makes the layer eligible for the Triton Conv1d path.
+
+\paragraph{Triton int8 weight-only Conv1d.}
+Eligible wide Conv1d layers are replaced by a custom Triton kernel. Weights are
+stored as symmetric int8 values with one scale per output channel:
+\[
+  \alpha_c = \frac{\max |W_c|}{127}, \qquad
+  Q_c = \mathrm{round}(W_c / \alpha_c).
+\]
+The kernel dequantizes inside the matrix multiply, accumulates in fp32 using
+\texttt{tl.dot}, and stores outputs in the input activation dtype. Heads,
+adapters, LoRA/LoCon modules, and other sensitive paths are excluded.
+
+\paragraph{No-intermediates encoder path.}
+When only 128 bp predictions are requested, the decoder does not consume the
+encoder U-Net skip tensors. The patched encoder therefore does not retain these
+intermediate tensors during evaluation.
+
+\paragraph{Triton no-indices max-pooling.}
+The encoder pool has kernel size 2 and stride 2. The custom Triton kernel loads
+the two candidate positions and stores only their maximum, matching the local
+ceil-length SAME pooling behavior while avoiding PyTorch's hidden max-pool
+index/workspace allocation.
+
+\paragraph{Fused DNA embedder block.}
+The \texttt{encoder.dna\_embedder.block} module is fused into one Triton kernel
+implementing
+\[
+  \mathrm{RMSBatchNorm} \rightarrow \mathrm{GELU}_{\mathrm{JAX}}
+  \rightarrow \mathrm{Conv1d}_{\mathrm{int8~weight-only}}.
+\]
+The RMSBatchNorm step uses stored running variance and affine parameters,
+\[
+  x_{\mathrm{norm}} =
+  x \cdot \gamma \cdot \mathrm{rsqrt}(\mathrm{running\_var} + \epsilon) + \beta.
+\]
+The activation is AlphaGenome/JAX's sigmoid approximation rather than the
+standard erf GELU:
+\[
+  \mathrm{GELU}_{\mathrm{JAX}}(x) = x \cdot \sigma(1.702x).
+\]
+The fused kernel applies normalization and activation immediately before the
+int8 weight-only convolution, without materializing the full-resolution
+normalized or activated tensors.
+
+This saves VRAM because the unfused path creates separate full-resolution
+temporary tensors for normalization, activation, and convolution input. At
+131 kb and batch size 32, these temporaries are large enough to drive allocator
+reservation and observed peak memory. The fused kernel streams through the
+operation and only stores the final block output.
+
+\paragraph{Fused first downsampling block.}
+The \texttt{encoder.down\_blocks.0} module is replaced by a wrapper containing
+two fused ConvBlocks and lean residual accumulation. In inference, the first
+block output already has the expanded channel dimension, so the residual input
+is added in-place into the leading input-channel slice instead of constructing
+an explicitly padded residual tensor. The second residual add is also in-place.
+This saves VRAM by avoiding both the ConvBlock temporaries described above and
+the explicit padded residual tensor for the first channel-expanding down block.
+The benefit appears mostly as lower reserved/observed device memory because the
+peak allocator state is sensitive to high-resolution transient tensors.
+
+\paragraph{FlexAttention and low-resolution attention bias.}
+The FlexAttention path replaces AlphaGenome's Torch MHA block forward method
+while preserving the model's score transform,
+\[
+  \mathrm{score} =
+  \tanh\left(\frac{qk / \sqrt{128} + \mathrm{bias}}{5}\right) \cdot 5,
+\]
+before softmax. Queries and keys still use AlphaGenome RoPE, grouped-query
+attention is enabled, and \texttt{RowAttentionBlock} remains eager. The LRB
+variant patches \texttt{AttentionBiasBlock} so it returns the natural
+pairwise-resolution bias tensor instead of the full repeated
+attention-resolution tensor. FlexAttention then indexes this low-resolution bias
+inside \texttt{score\_mod} with \texttt{q\_idx // 16} and
+\texttt{kv\_idx // 16}, preserving the repeated-bias semantics while avoiding
+the large materialized \(B \times 8 \times S \times S\) bias tensor.
+
+\section{Results}
+
+Tables use feature indicators for bfloat16 policy (BF16), effective
+standardized convolutions (Eff.), Triton int8 Conv1d (Int8), no-intermediates
+encoder path (NoInt), Triton no-indices max-pool (Pool), fused DNA embedder
+block (FEmb), fused first downsampling block (FD0), FlexAttention (Flex), and
+low-resolution attention bias (LRB). FlexAttention rows are side branches on top
+of the Triton Conv1d baseline rather than cumulative encoder-memory rows.
+
+\begin{table}[h]
+\centering
+\caption{Full valid/test evaluation for 131 kb windows at batch size 32.}
+\label{tab:vram-131kb}
+\tiny
+\setlength{\tabcolsep}{2pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccccc rrr}
+\toprule
+Strategy & BF16 & Eff. & Int8 & NoInt & Pool & FEmb & FD0 & Flex & LRB & Peak GiB & Ex./s & Test \(r\) \\
+\midrule
+Default &  &  &  &  &  &  &  &  &  & 90.46 & 9.41 & 0.80891 \\
+Bfloat16 & \cmark &  &  &  &  &  &  &  &  & 65.37 & 12.02 & 0.80874 \\
+Triton Conv1d & \cmark & \cmark & \cmark &  &  &  &  &  &  & 42.59 & 8.49 & 0.80877 \\
+FlexAttention & \cmark & \cmark & \cmark &  &  &  &  & \cmark &  & 42.59 & 7.27 & 0.80876 \\
+Flex low-res bias & \cmark & \cmark & \cmark &  &  &  &  & \cmark & \cmark & 42.59 & 7.27 & 0.80876 \\
+No intermediates & \cmark & \cmark & \cmark & \cmark &  &  &  &  &  & 42.59 & 8.51 & 0.80877 \\
+Triton pool & \cmark & \cmark & \cmark & \cmark & \cmark &  &  &  &  & 34.09 & 8.78 & 0.80877 \\
+Fused embedder & \cmark & \cmark & \cmark & \cmark & \cmark & \cmark &  &  &  & 31.59 & 8.03 & 0.80872 \\
+Fused down0 & \cmark & \cmark & \cmark & \cmark & \cmark &  & \cmark &  &  & 30.59 & 8.11 & 0.80860 \\
+Fused embedder+down0 & \cmark & \cmark & \cmark & \cmark & \cmark & \cmark & \cmark &  &  & 24.59 & 7.45 & 0.80860 \\
+All features & \cmark & \cmark & \cmark & \cmark & \cmark & \cmark & \cmark & \cmark & \cmark & 24.59 & 6.54 & 0.80860 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+At 131 kb, the lowest-memory successful configuration was the fused
+embedder+down0 strategy, reducing observed peak memory from 90.46 GiB to
+24.59 GiB relative to default. The best non-fused memory-efficient option was
+the Triton-pool strategy, at 34.09 GiB with no visible test metric change
+relative to the Triton Conv1d baseline. FlexAttention did not reduce memory at
+this context length and was slower than eager attention. Turning on all features
+tied the lowest observed memory but further reduced throughput.
+
+\begin{table}[h]
+\centering
+\caption{Full valid/test evaluation for 1 Mb windows at batch size 2.}
+\label{tab:vram-1mb}
+\tiny
+\setlength{\tabcolsep}{2pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccccc rrr}
+\toprule
+Strategy & BF16 & Eff. & Int8 & NoInt & Pool & FEmb & FD0 & Flex & LRB & Peak GiB & Ex./s & Test \(r\) \\
+\midrule
+Default &  &  &  &  &  &  &  &  &  & 51.36 & 0.721 & 0.82707 \\
+Bfloat16 & \cmark &  &  &  &  &  &  &  &  & 46.48 & 0.937 & 0.82640 \\
+Triton Conv1d & \cmark & \cmark & \cmark &  &  &  &  &  &  & 32.58 & 0.736 & 0.82662 \\
+FlexAttention & \cmark & \cmark & \cmark &  &  &  &  & \cmark &  & 28.58 & 0.746 & 0.82663 \\
+Flex low-res bias & \cmark & \cmark & \cmark &  &  &  &  & \cmark & \cmark & 20.58 & 0.827 & 0.82663 \\
+No intermediates & \cmark & \cmark & \cmark & \cmark &  &  &  &  &  & 28.58 & 0.749 & 0.82662 \\
+Triton pool & \cmark & \cmark & \cmark & \cmark & \cmark &  &  &  &  & 30.08 & 0.753 & 0.82662 \\
+Fused embedder & \cmark & \cmark & \cmark & \cmark & \cmark & \cmark &  &  &  & 28.83 & 0.701 & 0.82658 \\
+Fused down0 & \cmark & \cmark & \cmark & \cmark & \cmark &  & \cmark &  &  & 26.58 & 0.697 & 0.82643 \\
+Fused embedder+down0 & \cmark & \cmark & \cmark & \cmark & \cmark & \cmark & \cmark &  &  & 23.58 & 0.650 & 0.82634 \\
+All features & \cmark & \cmark & \cmark & \cmark & \cmark & \cmark & \cmark & \cmark & \cmark & 11.58 & 0.772 & 0.82637 \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+At 1 Mb, default inference exceeded 48 GiB. Plain bfloat16 inference fit just
+under 48 GiB, while the Triton/no-intermediates family reduced memory
+substantially further. The fused blocks primarily reduced observed memory at
+this longer context length; they are useful for minimum VRAM but not for maximum
+throughput. The low-res-bias FlexAttention path became useful at 1 Mb: it
+avoided expanding the attention bias to the full repeated tensor, reduced
+observed peak memory by about 12 GiB relative to the Triton Conv1d baseline, and
+improved throughput by about 12\%, with unchanged test differential Pearson at
+displayed precision. The all-features row produced the lowest observed memory
+at 11.58 GiB, with lower throughput than FlexAttention low-res bias alone but
+still higher throughput than the fused embedder+down0 row.
+
+\section{Discussion}
+
+The most robust practical configuration is the combination of bfloat16,
+precomputed standardized convolutions, Triton int8 weight-only Conv1d, the
+128 bp no-intermediates encoder path, and Triton no-indices max-pooling. This
+configuration kept peak memory below 48 GiB for both tested input lengths while
+preserving test differential Pearson relative to the Triton Conv1d baseline. The
+fused high-resolution blocks are useful when minimizing observed memory is more
+important than maximizing throughput.
+
+\paragraph{Linear-only quantization.}
+The \texttt{torchao\_float8\_linear} and
+\texttt{bnb\_nf4\_weight\_only\_linear} strategies are implemented in
+\texttt{scripts/run\_quant\_ablation.py} and were benchmarked, but they are not
+included in the recommended stack. Linear-only float8 did not reduce actual
+device memory relative to \texttt{bf16\_params} in the physical-batch runs, and
+was slower at batch 20: 11.50 examples/s versus 12.55 examples/s for
+\texttt{bf16\_params}, both at about 36.2 GiB observed memory. NF4/NVFP4 linear
+and 1x1-convolution quantization helped in smaller weight-focused sweeps, but
+once wide convolutions are handled by the Triton int8 Conv1d path, the peak is
+dominated by activations, high-resolution convolution temporaries, pooling
+workspace, and allocator reservation. In the matched batch-32 combo run, adding
+NF4 linears and 1x1 convolutions to the Triton-conv stack used essentially the
+same observed memory as the bfloat16 Triton-conv stack, 43.62 GiB versus
+43.61 GiB, with about a 0.001 drop in test differential Pearson.
+
+\paragraph{FlexAttention.}
+A parity-preserving FlexAttention replacement for \texttt{MHABlock} was
+implemented as \texttt{flex\_mha}. It preserves the AlphaGenome score transform:
+additive attention bias, then tanh soft-cap, then softmax. The low-res-bias
+variant keeps the attention bias at the lower pairwise-resolution grid and
+indexes it inside FlexAttention rather than materializing the full repeated
+attention-bias tensor. Standalone parity was close, and full-model test
+differential Pearson was unchanged at displayed precision. FlexAttention is
+context-dependent: it did not help at 131 kb, but the low-res-bias variant was
+useful at 1 Mb.
+
+\end{document}
