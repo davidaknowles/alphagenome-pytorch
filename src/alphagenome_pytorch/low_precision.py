@@ -13,6 +13,7 @@ from collections.abc import Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from packaging.version import Version
 
 
 try:
@@ -517,6 +518,20 @@ def _wrap_linears_by_weight_class_name(model: nn.Module, class_name: str) -> int
     return wrapped
 
 
+def _wrap_modules_by_class_name(model: nn.Module, class_name: str) -> int:
+    named_modules = dict(model.named_modules())
+    wrapped = 0
+    for fqn, module in list(named_modules.items()):
+        if fqn == "" or module.__class__.__name__ != class_name:
+            continue
+        child_name = fqn.split(".")[-1]
+        parent_fqn = fqn.removesuffix(child_name).removesuffix(".")
+        parent = named_modules[parent_fqn]
+        setattr(parent, child_name, _ContiguousInputWrapper(module))
+        wrapped += 1
+    return wrapped
+
+
 def _iter_named_child_modules(model: nn.Module):
     named_modules = dict(model.named_modules())
     for fqn, module in list(named_modules.items()):
@@ -777,6 +792,76 @@ def convert_linears_to_nvfp4_weight_only(
     return Float4ConversionStats(
         backend="torchao",
         mode="weight_only",
+        converted_linears=converted,
+        skipped_linears=skipped,
+        min_feature_multiple=min_feature_multiple,
+        skipped_name_patterns=patterns,
+        include_name_patterns=include_patterns,
+        quant_type="nvfp4",
+    )
+
+
+def convert_linears_to_nvfp4_qat_training(
+    model: nn.Module,
+    *,
+    min_feature_multiple: int = 16,
+    skip_name_patterns: Iterable[str] = ("heads", "lora_", "locon_", "ia3", "adapter"),
+    include_name_patterns: Iterable[str] = (),
+    use_triton_kernel: bool = False,
+) -> Float4ConversionStats:
+    """Convert eligible ``nn.Linear`` modules to torchao NVFP4 QAT linears."""
+    if min_feature_multiple < 1:
+        raise ValueError("min_feature_multiple must be >= 1")
+
+    try:
+        import torchao
+        from torchao.prototype.mx_formats import NVFP4DynamicActivationNVFP4WeightConfig
+        from torchao.quantization import quantize_
+        from torchao.quantization.qat import QATConfig
+    except ImportError as exc:
+        raise RuntimeError("torchao is required for NVFP4 QAT conversion.") from exc
+
+    torchao_version = Version(str(getattr(torchao, "__version__", "0")).split("+", 1)[0])
+    torch_version = Version(str(torch.__version__).split("+", 1)[0])
+    if torchao_version < Version("0.18.0") and torch_version < Version("2.11.0"):
+        raise RuntimeError(
+            "torchao NVFP4 QAT currently fails on CUDA with torchao<0.18 and "
+            "torch<2.11 (`Float4_e2m1fn_x2` cannot be converted to a CUDA dtype). "
+            "Use fp4 weight-only mode for frozen-base LoRA/LoCon runs, or use a "
+            "Torch/TorchAO stack where NVFP4 QAT is supported."
+        )
+
+    patterns = tuple(skip_name_patterns)
+    include_patterns = tuple(include_name_patterns)
+    decisions: dict[str, bool] = {}
+
+    def module_filter_fn(mod: nn.Module, fqn: str) -> bool:
+        eligible = (
+            isinstance(mod, nn.Linear)
+            and mod.in_features % min_feature_multiple == 0
+            and mod.out_features % min_feature_multiple == 0
+            and _matches_include_patterns(fqn, include_patterns)
+            and not _matches_any_pattern(fqn, patterns)
+        )
+        if isinstance(mod, nn.Linear):
+            decisions[fqn] = eligible
+        return eligible
+
+    base_config = NVFP4DynamicActivationNVFP4WeightConfig(
+        use_triton_kernel=use_triton_kernel,
+    )
+    quantize_(
+        model,
+        QATConfig(base_config, step="prepare"),
+        filter_fn=module_filter_fn,
+    )
+    _wrap_modules_by_class_name(model, "NVFP4FakeQuantizedLinear")
+
+    converted = sum(1 for selected in decisions.values() if selected)
+    skipped = sum(1 for selected in decisions.values() if not selected)
+    return Float4ConversionStats(
+        backend="torchao",
+        mode="qat_prepare",
         converted_linears=converted,
         skipped_linears=skipped,
         min_feature_multiple=min_feature_multiple,
