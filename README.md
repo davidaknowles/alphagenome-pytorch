@@ -47,8 +47,8 @@ pip install alphagenome-pytorch[low-vram]
 ## Quick Start
 
 ```python
-import torch
 import numpy as np
+import torch
 from alphagenome_pytorch import AlphaGenome
 
 # Load pretrained model
@@ -61,6 +61,45 @@ dna_onehot = torch.tensor(np.eye(4)[sequence], dtype=torch.float32).cuda()
 
 # Inference (handles dtype casting, returns float32 outputs)
 outputs = model.predict(dna_onehot, organism_index=0)  # organism: 0=human, 1=mouse
+```
+
+For low-VRAM inference, keep the same model loading and prediction calls, then
+apply a runtime transform before calling `predict`:
+
+```python
+import numpy as np
+import torch
+from alphagenome_pytorch import (
+    AlphaGenome,
+    LowVramInferenceConfig,
+    apply_low_vram_inference,
+)
+
+model = AlphaGenome.from_pretrained('alphagenome.pt', device='cuda')
+
+# The most memory-saving preset used in the benchmark tables.
+stats = apply_low_vram_inference(model, LowVramInferenceConfig.all_features())
+
+sequence = np.random.randint(0, 4, size=(1, 131072))
+dna_onehot = torch.tensor(np.eye(4)[sequence], dtype=torch.float32, device='cuda')
+outputs = model.predict(dna_onehot, organism_index=0)
+```
+
+`LowVramInferenceConfig` exposes the individual memory-saving options so they can
+be enabled independently:
+
+```python
+config = LowVramInferenceConfig(
+    bf16_params=True,
+    materialize_standardized_convs=True,
+    triton_int8_conv1d=True,
+    encoder_no_intermediates=True,       # for 128 bp output-only inference
+    encoder_triton_pool=True,
+    encoder_fused_dna_embedder_block=True,
+    encoder_fused_down_block0=True,
+    attention_backend='flex_mha_lowres_bias',
+)
+apply_low_vram_inference(model, config)
 ```
 
 The weights for this port are [available on Hugging Face](https://huggingface.co/gtca/alphagenome_pytorch).

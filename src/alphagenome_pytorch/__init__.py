@@ -23,9 +23,12 @@ except ImportError:
     __version__ = "0.0.0.dev0"
     __version_tuple__ = (0, 0, 0, "dev0")
 
+from .low_precision import LowVramInferenceConfig, apply_low_vram_inference
 from .model import AlphaGenome
 
 __all__ = [
     '__version__',
     'AlphaGenome',
+    'LowVramInferenceConfig',
+    'apply_low_vram_inference',
 ]
