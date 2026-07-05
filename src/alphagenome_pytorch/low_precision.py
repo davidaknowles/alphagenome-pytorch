@@ -429,77 +429,6 @@ if triton is not None:
         tl.store(out_ptr + out_offsets, acc, mask=out_mask)
 
 
-    @triton.jit
-    def _int8_dynamic_activation_int8_weight_conv1d_kernel(
-        x_ptr,
-        qweight_ptr,
-        weight_scale_ptr,
-        bias_ptr,
-        out_ptr,
-        total_positions: tl.constexpr,
-        batch: tl.constexpr,
-        in_channels: tl.constexpr,
-        out_channels: tl.constexpr,
-        length: tl.constexpr,
-        kernel_width: tl.constexpr,
-        pad_left: tl.constexpr,
-        has_bias: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-        BLOCK_K: tl.constexpr,
-    ):
-        pid_m = tl.program_id(0)
-        pid_n = tl.program_id(1)
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        batch_idx = offs_m // length
-        pos_idx = offs_m - batch_idx * length
-        weight_scale = tl.load(
-            weight_scale_ptr + offs_n, mask=offs_n < out_channels, other=0.0
-        ).to(tl.float32)
-
-        acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
-        for k_start in range(0, in_channels * kernel_width, BLOCK_K):
-            offs_k = k_start + tl.arange(0, BLOCK_K)
-            chan_idx = offs_k // kernel_width
-            kernel_idx = offs_k - chan_idx * kernel_width
-            input_pos = pos_idx[:, None] + kernel_idx[None, :] - pad_left
-            # Long 131k windows at larger batch sizes exceed int32 offsets.
-            x_offsets = (
-                batch_idx[:, None].to(tl.int64) * in_channels * length
-                + chan_idx[None, :].to(tl.int64) * length
-                + input_pos.to(tl.int64)
-            )
-            x_mask = (
-                (offs_m[:, None] < total_positions)
-                & (offs_k[None, :] < in_channels * kernel_width)
-                & (input_pos >= 0)
-                & (input_pos < length)
-            )
-            x_vals = tl.load(x_ptr + x_offsets, mask=x_mask, other=0.0).to(tl.float32)
-            x_absmax = tl.max(tl.abs(x_vals), axis=1)
-            x_scale = tl.maximum(x_absmax / 127.0, 1.0e-8)
-            x_quant = tl.extra.libdevice.nearbyint(x_vals / x_scale[:, None])
-            x_quant = tl.minimum(tl.maximum(x_quant, -127.0), 127.0).to(tl.int8)
-
-            w_offsets = offs_n[None, :] * in_channels * kernel_width + offs_k[:, None]
-            w_mask = (offs_n[None, :] < out_channels) & (offs_k[:, None] < in_channels * kernel_width)
-            w_vals = tl.load(qweight_ptr + w_offsets, mask=w_mask, other=0)
-            dot = tl.dot(x_quant, w_vals, out_dtype=tl.int32)
-            acc += dot.to(tl.float32) * x_scale[:, None] * weight_scale[None, :]
-
-        if has_bias:
-            bias = tl.load(bias_ptr + offs_n, mask=offs_n < out_channels, other=0.0).to(tl.float32)
-            acc += bias[None, :]
-        out_offsets = (
-            batch_idx[:, None].to(tl.int64) * out_channels * length
-            + offs_n[None, :].to(tl.int64) * length
-            + pos_idx[:, None].to(tl.int64)
-        )
-        out_mask = (offs_m[:, None] < total_positions) & (offs_n[None, :] < out_channels)
-        tl.store(out_ptr + out_offsets, acc, mask=out_mask)
-
-
 class Int8WeightOnlyConv1d(nn.Module):
     """Triton int8 weight-only Conv1d for NCL inference tensors."""
 
@@ -570,42 +499,6 @@ class Int8WeightOnlyConv1d(nn.Module):
             BLOCK_K=64,
         )
         return out
-
-
-class Int8DynamicActivationInt8WeightConv1d(Int8WeightOnlyConv1d):
-    """Triton dynamic-int8 activation and int8 weight Conv1d."""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() != 3:
-            raise ValueError(f"Expected NCL input, got shape {tuple(x.shape)}")
-        if not x.is_cuda:
-            return super().forward(x)
-        x = x.contiguous()
-        batch, in_channels, length = x.shape
-        if in_channels != self.in_channels:
-            raise ValueError(f"Expected {self.in_channels} input channels, got {in_channels}.")
-        out = torch.empty((batch, self.out_channels, length), device=x.device, dtype=x.dtype)
-        grid = (triton.cdiv(batch * length, 32), triton.cdiv(self.out_channels, 32))
-        _int8_dynamic_activation_int8_weight_conv1d_kernel[grid](
-            x,
-            self.qweight,
-            self.scale,
-            self.bias,
-            out,
-            batch * length,
-            batch,
-            self.in_channels,
-            self.out_channels,
-            length,
-            self.kernel_size[0],
-            self.pad_left,
-            self.has_bias,
-            BLOCK_M=32,
-            BLOCK_N=32,
-            BLOCK_K=64,
-        )
-        return out
-
 
 def _wrap_linears_by_weight_class_name(model: nn.Module, class_name: str) -> int:
     named_modules = dict(model.named_modules())
@@ -775,57 +668,6 @@ def convert_conv1d_to_triton_int8_weight_only(
         "triton_int8_conv1d_skip_name_patterns": patterns,
         "triton_int8_conv1d_include_name_patterns": include_patterns,
     }
-
-
-def convert_conv1d_to_triton_int8_dynamic_activation_int8_weight(
-    model: nn.Module,
-    *,
-    min_kernel_size: int = 2,
-    min_feature_multiple: int = 16,
-    skip_name_patterns: Iterable[str] = ("heads", "lora_", "locon_", "ia3", "adapter"),
-    include_name_patterns: Iterable[str] = (),
-) -> dict[str, object]:
-    """Replace eligible Conv1d modules with dynamic-int8 activation/weight kernels."""
-    if triton is None:
-        raise RuntimeError("triton is required for custom int8 Conv1d quantization.")
-    patterns = tuple(skip_name_patterns)
-    include_patterns = tuple(include_name_patterns)
-    decisions: dict[str, bool] = {}
-    replacements: list[tuple[nn.Module, str, nn.Module]] = []
-
-    for fqn, module, parent, child_name in _iter_named_child_modules(model):
-        if not isinstance(module, nn.Conv1d):
-            continue
-        eligible = (
-            module.__class__.__name__ != "StandardizedConv1d"
-            and module.kernel_size[0] >= min_kernel_size
-            and module.stride == (1,)
-            and module.dilation == (1,)
-            and module.groups == 1
-            and module.in_channels % min_feature_multiple == 0
-            and module.out_channels % min_feature_multiple == 0
-            and _matches_include_patterns(fqn, include_patterns)
-            and not _matches_any_pattern(fqn, patterns)
-        )
-        decisions[fqn] = eligible
-        if eligible:
-            replacements.append((parent, child_name, Int8DynamicActivationInt8WeightConv1d(module)))
-
-    for parent, child_name, replacement in replacements:
-        setattr(parent, child_name, replacement)
-
-    converted = sum(1 for selected in decisions.values() if selected)
-    skipped = sum(1 for selected in decisions.values() if not selected)
-    return {
-        "backend": "triton",
-        "mode": "dynamic_activation_weight",
-        "quant_type": "int8",
-        "converted_triton_int8_dynamic_conv1ds": converted,
-        "skipped_triton_int8_dynamic_conv1ds": skipped,
-        "triton_int8_dynamic_conv1d_skip_name_patterns": patterns,
-        "triton_int8_dynamic_conv1d_include_name_patterns": include_patterns,
-    }
-
 
 def convert_linears_to_float8_training(
     model: nn.Module,
