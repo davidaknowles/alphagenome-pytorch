@@ -102,6 +102,23 @@ config = LowVramInferenceConfig(
 apply_low_vram_inference(model, config)
 ```
 
+Headline 1 Mb results from the full valid/test ATAC evaluation at batch size 2:
+
+| Strategy | Features | Peak GiB | Examples/s | Test r |
+|---|---|---:|---:|---:|
+| default | - | 51.36 | 0.721 | 0.82707 |
+| bf16 params | BF16 | 46.48 | 0.937 | 0.82640 |
+| Triton Conv1d | BF16, Eff., Int8 | 32.58 | 0.736 | 0.82662 |
+| Flex low-res bias | BF16, Eff., Int8, Flex, LRB | 20.58 | 0.827 | 0.82663 |
+| fused embed+down0 | BF16, Eff., Int8, NoInt, Pool, FEmb, FD0 | 23.58 | 0.650 | 0.82634 |
+| all features | BF16, Eff., Int8, NoInt, Pool, FEmb, FD0, Flex, LRB | 11.58 | 0.772 | 0.82637 |
+
+Feature abbreviations: Eff. = materialized effective convolutions; Int8 =
+Triton int8 weight-only Conv1d; NoInt = skip unused encoder intermediates;
+Pool = Triton no-indices max-pool; FEmb = fused DNA embedder block; FD0 =
+fused first downsampling block; Flex = FlexAttention; LRB = low-resolution
+attention bias.
+
 The weights for this port are [available on Hugging Face](https://huggingface.co/gtca/alphagenome_pytorch).
 
 ### Output structure
