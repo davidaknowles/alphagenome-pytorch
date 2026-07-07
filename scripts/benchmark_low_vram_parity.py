@@ -385,6 +385,35 @@ def _compare_to_reference(
     }
 
 
+def _run_forward_only(
+    *,
+    args: argparse.Namespace,
+    model: Any,
+    intervals: list[Interval],
+    device: Any,
+) -> dict[str, Any]:
+    from pyfaidx import Fasta
+
+    fasta = Fasta(str(args.fasta_path.expanduser().resolve()), as_raw=True, sequence_always_upper=True)
+    batches = 0
+    examples = 0
+    start_time = time.perf_counter()
+    for _start_idx, seq_np in _iter_sequence_batches(fasta=fasta, intervals=intervals, batch_size=args.batch_size):
+        _predict_batch(model, seq_np, head=args.head, device=device)
+        batches += 1
+        examples += int(seq_np.shape[0])
+    elapsed = time.perf_counter() - start_time
+    return {
+        "reference_predictions": None,
+        "reference_shape": None,
+        "batches": batches,
+        "examples": examples,
+        "elapsed_sec": elapsed,
+        "examples_per_sec": examples / elapsed if elapsed > 0 else None,
+        "parity": None,
+    }
+
+
 def _write_metrics(out_dir: Path, metrics: dict[str, Any]) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     with (out_dir / "metrics.json").open("w") as handle:
@@ -415,7 +444,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--strategy", required=True, choices=tuple(TABLE_STRATEGIES))
     parser.add_argument("--write-reference", action="store_true")
-    parser.add_argument("--reference-predictions", type=Path, required=True)
+    parser.add_argument("--skip-parity", action="store_true")
+    parser.add_argument("--reference-predictions", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--og-weights", type=Path, default=DEFAULT_OG_WEIGHTS)
     parser.add_argument("--fasta-path", type=Path, default=DEFAULT_FASTA)
@@ -430,6 +460,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.write_reference and args.skip_parity:
+        raise ValueError("--write-reference and --skip-parity are mutually exclusive.")
+    if not args.skip_parity and args.reference_predictions is None:
+        raise ValueError("--reference-predictions is required unless --skip-parity is set.")
 
     import torch
 
@@ -454,6 +488,8 @@ def main() -> None:
     with torch.inference_mode(), GpuSampler(gpu_path, interval_sec=args.gpu_sample_interval):
         if args.write_reference:
             run_metrics = _write_reference(args=args, model=model, intervals=intervals, device=device)
+        elif args.skip_parity:
+            run_metrics = _run_forward_only(args=args, model=model, intervals=intervals, device=device)
         else:
             run_metrics = _compare_to_reference(args=args, model=model, intervals=intervals, device=device)
 
@@ -470,6 +506,7 @@ def main() -> None:
         "strategy_key": args.strategy,
         "strategy": strategy,
         "write_reference": bool(args.write_reference),
+        "skip_parity": bool(args.skip_parity),
         "head": args.head,
         "chrom": args.chrom,
         "window_size": args.window_size,
