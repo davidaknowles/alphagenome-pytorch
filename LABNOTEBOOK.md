@@ -8,7 +8,7 @@ ATAC supervision uses every available BigWig at 128 bp resolution. RNA supervisi
 
 Chromosome splits are generated independently for each assembly. Human uses chromosomes 8 and 9 for validation and test. Other assemblies prefer the same labels when present and otherwise use deterministic primary-contig ranks. Metrics are recorded for each species and split, including profile correlation, bin correlation, differential correlation, and loss.
 
-Variant scoring uses human ATAC and RNA heads on fine-mapped variants. The first benchmark compares maximum absolute predicted effect with SuSiE posterior inclusion probability using Spearman correlation and AUROC at PIP at least 0.1. This is a prioritization test because PIP has no effect direction.
+Variant scoring uses human ATAC and RNA heads on fine-mapped variants. The benchmark defines every variant-gene fine-map row with SuSiE PIP greater than 0.75 as positive. It samples one negative with PIP less than 0.01 per positive, without replacement, within base-2 distance-to-TSS strata. The reported discrimination metrics are AUROC and average precision for maximum absolute predicted effect. Distance matching is checked with a two-sample Kolmogorov-Smirnov statistic.
 
 The requested fine-map path was absent. The data are available through the project’s public `singlebrain_full_finemap` location. Production results will be added after the smoke and full jobs complete.
 
@@ -19,3 +19,7 @@ The focused suite passed 106 tests. A one-epoch run used two training windows an
 ATAC profile correlations on the single test windows were 0.0016 for human, 0.0395 for macaque, and 0.0063 for marmoset. Single-window RNA correlations were zero when the sampled window contained no complete annotated gene, so these are pipeline checks rather than performance estimates. Production evaluation uses every held-out chromosome window.
 
 Delta checkpoint reload and six-head evaluation completed. ATAC and RNA effects were produced for two fine-mapped variants. Correlation and AUROC were undefined at this smoke size and will be estimated in the production variant run.
+
+## 2026-08-08, production progress
+
+The production run completed four epochs and was partway through epoch five at the latest check. Mean validation loss decreased from 0.11236 after epoch one to 0.10660 after epoch four. Epoch-four validation losses were 0.13295 for human, 0.05517 for macaque, and 0.13168 for marmoset. Evaluation and variant scoring remain dependency-gated on training.

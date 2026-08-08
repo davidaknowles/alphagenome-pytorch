@@ -4,11 +4,7 @@
 from __future__ import annotations
 
 import argparse
-import csv
-import gzip
-import heapq
 import json
-from itertools import count
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +21,10 @@ from alphagenome_pytorch.variant_scoring import (
     Variant,
     VariantScoringModel,
 )
+from alphagenome_pytorch.variant_scoring.benchmark import (
+    load_gene_tss,
+    select_pip_matched_variants,
+)
 
 
 DEFAULT_FINEMAP = Path(
@@ -37,44 +37,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--pretrained-weights", type=Path, required=True)
     parser.add_argument("--fasta", type=Path, required=True)
+    parser.add_argument("--gtf", type=Path)
+    parser.add_argument("--benchmark-variants", type=Path)
     parser.add_argument("--finemap-dir", type=Path, default=DEFAULT_FINEMAP)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--max-variants", type=int, default=1000)
-    parser.add_argument("--min-pip", type=float, default=0.01)
+    parser.add_argument("--positive-pip", type=float, default=0.75)
+    parser.add_argument("--negative-pip", type=float, default=0.01)
+    parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--limit-pairs", type=int)
     parser.add_argument("--width", type=int, default=131_072)
     return parser.parse_args()
-
-
-def open_text(path: Path):
-    return gzip.open(path, "rt") if path.suffix == ".gz" else path.open()
-
-
-def select_variants(directory: Path, max_variants: int, min_pip: float) -> list[dict[str, str]]:
-    heap: list[tuple[float, int, dict[str, str]]] = []
-    serial = count()
-    paths = sorted(directory.glob("*_all.susie_all_credible_sets.tsv"))
-    if not paths:
-        paths = sorted(directory.glob("*_all.susie_all_pip.tsv.gz"))
-    for path in paths:
-        with open_text(path) as handle:
-            for row in csv.DictReader(handle, delimiter="\t"):
-                pip = float(row["susie_pip"])
-                if pip < min_pip:
-                    continue
-                item = (pip, next(serial), row)
-                if len(heap) < max_variants:
-                    heapq.heappush(heap, item)
-                elif pip > heap[0][0]:
-                    heapq.heapreplace(heap, item)
-    selected = [item[2] for item in sorted(heap, reverse=True)]
-    seen = set()
-    unique = []
-    for row in selected:
-        key = (row["chr"], row["pos"], row["ref"], row["alt"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(row)
-    return unique
 
 
 def auroc(labels: np.ndarray, scores: np.ndarray) -> float:
@@ -86,8 +58,37 @@ def auroc(labels: np.ndarray, scores: np.ndarray) -> float:
     return float((ranks[labels].sum() - positives * (positives + 1) / 2) / (positives * negatives))
 
 
+def average_precision(labels: np.ndarray, scores: np.ndarray) -> float:
+    """Compute tie-invariant average precision."""
+    positives = int(labels.sum())
+    if positives == 0:
+        return float("nan")
+    order = np.argsort(-scores, kind="stable")
+    ordered_labels = labels[order]
+    ordered_scores = scores[order]
+    threshold_ends = np.r_[np.flatnonzero(np.diff(ordered_scores)), labels.size - 1]
+    true_positives = np.cumsum(ordered_labels)[threshold_ends]
+    precision = true_positives / (threshold_ends + 1)
+    recall_increments = np.diff(np.r_[0, true_positives]) / positives
+    return float(np.sum(recall_increments * precision))
+
+
 def main() -> None:
     args = parse_args()
+    if args.benchmark_variants is not None:
+        variants = pd.read_csv(args.benchmark_variants, sep="\t", dtype=str).to_dict("records")
+    else:
+        if args.gtf is None:
+            raise ValueError("--gtf is required when --benchmark-variants is not supplied")
+        fine_map_paths = sorted(args.finemap_dir.glob("*_all.susie_all_pip.tsv.gz"))
+        variants = select_pip_matched_variants(
+            fine_map_paths,
+            load_gene_tss(args.gtf),
+            positive_threshold=args.positive_pip,
+            negative_threshold=args.negative_pip,
+            seed=args.seed,
+            limit_pairs=args.limit_pairs,
+        )
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for variant scoring")
     device = torch.device("cuda")
@@ -105,20 +106,29 @@ def main() -> None:
         CenterMaskScorer(OutputType.ATAC, 100_001, AggregationType.DIFF_LOG2_SUM, resolution=128),
         CenterMaskScorer(OutputType.RNA_SEQ, 100_001, AggregationType.DIFF_LOG2_SUM, resolution=128),
     ]
-    variants = select_variants(args.finemap_dir, args.max_variants, args.min_pip)
     rows = []
+    score_cache = {}
     for index, row in enumerate(variants, start=1):
         variant = Variant(
             chromosome=row["chr"], position=int(row["pos"]),
             reference_bases=row["ref"], alternate_bases=row["alt"],
             name=row.get("variant_id", ""),
         )
-        interval = Interval.centered_on(variant.chromosome, variant.position - 1, args.width)
-        try:
-            scores = scoring_model.score_variant(interval, variant, scorers, to_cpu=True)
-        except (KeyError, ValueError, RuntimeError) as error:
-            print(f"Skipping {variant}: {error}")
-            continue
+        variant_key = (
+            variant.chromosome,
+            variant.position,
+            variant.reference_bases,
+            variant.alternate_bases,
+        )
+        scores = score_cache.get(variant_key)
+        if scores is None:
+            interval = Interval.centered_on(variant.chromosome, variant.position - 1, args.width)
+            try:
+                scores = scoring_model.score_variant(interval, variant, scorers, to_cpu=True)
+            except (KeyError, ValueError, RuntimeError) as error:
+                print(f"Skipping {variant}: {error}")
+                continue
+            score_cache[variant_key] = scores
         result = dict(row)
         for scorer, score in zip(scorers, scores, strict=True):
             values = score.scores.float().cpu().numpy()
@@ -126,21 +136,38 @@ def main() -> None:
             result[f"{scorer.requested_output.value}_mean_abs"] = float(np.mean(np.abs(values)))
         rows.append(result)
         if index % 25 == 0:
-            print(f"Scored {index}/{len(variants)} variants")
+            print(f"Processed {index}/{len(variants)} benchmark rows")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     frame = pd.DataFrame(rows)
-    frame.to_csv(args.output_dir / "variant_scores.tsv.gz", sep="\t", index=False)
     if frame.empty:
         raise RuntimeError("No fine-mapped variants were scored successfully")
-    pip = frame["susie_pip"].astype(float).to_numpy()
-    metrics = {"n_variants": len(frame), "pip_threshold": 0.1}
+    pair_sizes = frame.groupby("match_pair_id")["benchmark_label"].agg(["size", "nunique"])
+    complete_pair_ids = pair_sizes.index[(pair_sizes["size"] == 2) & (pair_sizes["nunique"] == 2)]
+    dropped_pairs = int(pair_sizes.shape[0] - complete_pair_ids.size)
+    frame = frame[frame["match_pair_id"].isin(complete_pair_ids)].copy()
+    if frame.empty:
+        raise RuntimeError("No complete positive-negative pairs were scored successfully")
+    frame.to_csv(args.output_dir / "variant_scores.tsv.gz", sep="\t", index=False)
+    labels = frame["benchmark_label"].astype(int).to_numpy(dtype=bool)
+    positive_distances = frame.loc[labels, "distance_to_tss"].astype(int).to_numpy()
+    negative_distances = frame.loc[~labels, "distance_to_tss"].astype(int).to_numpy()
+    distance_test = stats.ks_2samp(positive_distances, negative_distances)
+    metrics = {
+        "n_rows": len(frame),
+        "n_unique_variants": len(score_cache),
+        "n_dropped_pairs": dropped_pairs,
+        "n_positive": int(labels.sum()),
+        "n_negative": int((~labels).sum()),
+        "positive_pip_gt": args.positive_pip,
+        "negative_pip_lt": args.negative_pip,
+        "distance_to_tss_ks": float(distance_test.statistic),
+        "distance_to_tss_ks_pvalue": float(distance_test.pvalue),
+    }
     for modality in ("atac", "rna_seq"):
         values = frame[f"{modality}_max_abs"].to_numpy(dtype=float)
-        correlation = stats.spearmanr(pip, values)
-        metrics[f"{modality}_spearman_pip"] = float(correlation.statistic)
-        metrics[f"{modality}_spearman_pvalue"] = float(correlation.pvalue)
-        metrics[f"{modality}_auroc_pip_ge_0.1"] = auroc(pip >= 0.1, values)
+        metrics[f"{modality}_auroc"] = auroc(labels, values)
+        metrics[f"{modality}_average_precision"] = average_precision(labels, values)
     (args.output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
     print(json.dumps(metrics, indent=2))
 

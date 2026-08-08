@@ -55,5 +55,6 @@ python scripts/score_singlebrain_finemap.py \
   --checkpoint "$root/run/best_model.delta.pth" \
   --pretrained-weights "$pretrained" \
   --fasta /gpfs/commons/groups/knowles_lab/index/hg38/hg38.fa \
+  --gtf /gpfs/commons/groups/knowles_lab/index/hg38/gencode.v49.basic.annotation.gtf.gz \
   --output-dir "$root/run/variant_effects" \
-  --max-variants 2
+  --limit-pairs 2

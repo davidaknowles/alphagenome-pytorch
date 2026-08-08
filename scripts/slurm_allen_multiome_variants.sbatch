@@ -20,5 +20,5 @@ python scripts/score_singlebrain_finemap.py \
   --checkpoint "${CHECKPOINT:-finetuning_output/allen_multiome/run/best_model.delta.pth}" \
   --pretrained-weights "$PRETRAINED_WEIGHTS" \
   --fasta "${FASTA:-/gpfs/commons/groups/knowles_lab/index/hg38/hg38.fa}" \
-  --output-dir "${OUTPUT_DIR:-finetuning_output/allen_multiome/run/variant_effects}" \
-  --max-variants "${MAX_VARIANTS:-1000}"
+  --benchmark-variants "${BENCHMARK_VARIANTS:-finetuning_output/allen_multiome/run/variant_effects/benchmark_variants.tsv.gz}" \
+  --output-dir "${OUTPUT_DIR:-finetuning_output/allen_multiome/run/variant_effects}"
