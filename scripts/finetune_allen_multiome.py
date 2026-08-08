@@ -24,6 +24,7 @@ from alphagenome_pytorch.extensions.finetuning.datasets import (
 from alphagenome_pytorch.extensions.finetuning.training import (
     create_lr_scheduler,
     train_epoch_multihead,
+    validation_loss_improved,
     validate_multihead,
 )
 from alphagenome_pytorch.extensions.finetuning.transfer import (
@@ -40,6 +41,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretrained-weights", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--early-stopping-patience", type=int, default=2)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -116,6 +119,10 @@ def build_datasets(manifest: dict, args: argparse.Namespace, split: str):
 
 def main() -> None:
     args = parse_args()
+    if args.early_stopping_patience < 0:
+        raise ValueError("early_stopping_patience must be nonnegative")
+    if args.early_stopping_min_delta < 0:
+        raise ValueError("early_stopping_min_delta must be nonnegative")
     torch.manual_seed(args.seed)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for AlphaGenome fine-tuning")
@@ -175,6 +182,9 @@ def main() -> None:
     (args.output_dir / "config.json").write_text(json.dumps(run_config, indent=2) + "\n")
 
     best_loss = float("inf")
+    best_epoch = None
+    epochs_since_improvement = 0
+    stopped_early = False
     history = []
     for epoch in range(1, args.epochs + 1):
         epoch_train = {}
@@ -202,7 +212,25 @@ def main() -> None:
             )
             epoch_valid[species] = {"loss": loss, "metrics": metrics}
         mean_valid = sum(item["loss"] for item in epoch_valid.values()) / len(epoch_valid)
-        record = {"epoch": epoch, "train": epoch_train, "valid": epoch_valid, "mean_valid_loss": mean_valid}
+        improved = validation_loss_improved(
+            mean_valid,
+            best_loss,
+            min_delta=args.early_stopping_min_delta,
+        )
+        if improved:
+            best_loss = mean_valid
+            best_epoch = epoch
+            epochs_since_improvement = 0
+        else:
+            epochs_since_improvement += 1
+        record = {
+            "epoch": epoch,
+            "train": epoch_train,
+            "valid": epoch_valid,
+            "mean_valid_loss": mean_valid,
+            "is_best": improved,
+            "epochs_since_improvement": epochs_since_improvement,
+        }
         history.append(record)
         (args.output_dir / "history.json").write_text(json.dumps(history, indent=2) + "\n")
         checkpoint_args = dict(
@@ -211,10 +239,29 @@ def main() -> None:
             manifest=str(args.manifest.resolve()),
         )
         save_delta_checkpoint(args.output_dir / f"checkpoint_epoch{epoch}.delta.pth", **checkpoint_args)
-        if mean_valid < best_loss:
-            best_loss = mean_valid
+        if improved:
             save_delta_checkpoint(args.output_dir / "best_model.delta.pth", **checkpoint_args)
         print(json.dumps(record))
+        if (
+            args.early_stopping_patience > 0
+            and epochs_since_improvement >= args.early_stopping_patience
+        ):
+            stopped_early = True
+            print(
+                f"Early stopping after {epochs_since_improvement} epochs without "
+                "validation-loss improvement."
+            )
+            break
+
+    summary = {
+        "epochs_completed": len(history),
+        "best_epoch": best_epoch,
+        "best_validation_loss": best_loss,
+        "stopped_early": stopped_early,
+    }
+    (args.output_dir / "training_summary.json").write_text(
+        json.dumps(summary, indent=2) + "\n"
+    )
 
 
 if __name__ == "__main__":

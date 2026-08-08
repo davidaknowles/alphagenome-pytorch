@@ -15,7 +15,17 @@ from alphagenome_pytorch.extensions.finetuning.training import (
     collate_genomic,
     MODALITY_CONFIGS,
     ModalityConfig,
+    validation_loss_improved,
 )
+
+
+def test_validation_loss_improved_respects_min_delta_and_finite_values():
+    assert validation_loss_improved(0.8, 1.0, min_delta=0.1)
+    assert not validation_loss_improved(0.95, 1.0, min_delta=0.1)
+    assert not validation_loss_improved(float("nan"), 1.0)
+    assert validation_loss_improved(1.0, float("inf"))
+    with pytest.raises(ValueError, match="nonnegative"):
+        validation_loss_improved(0.8, 1.0, min_delta=-0.1)
 
 @pytest.mark.unit
 class TestCollateGenomic:

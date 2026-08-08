@@ -22,6 +22,8 @@ python scripts/finetune_allen_multiome.py \
   --pretrained-weights "$PRETRAINED_WEIGHTS" \
   --output-dir "${OUTPUT_DIR:-finetuning_output/allen_multiome_v0/run}" \
   --epochs "${EPOCHS:-5}" \
+  --early-stopping-patience "${EARLY_STOPPING_PATIENCE:-2}" \
+  --early-stopping-min-delta "${EARLY_STOPPING_MIN_DELTA:-0.0}" \
   --batch-size "${BATCH_SIZE:-2}" \
   --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS:-4}" \
   --num-workers "${NUM_WORKERS:-2}" \

@@ -35,6 +35,18 @@ if TYPE_CHECKING:
     from torch.optim import Optimizer
 
 
+def validation_loss_improved(
+    current: float,
+    best: float,
+    *,
+    min_delta: float = 0.0,
+) -> bool:
+    """Return whether validation loss improved by more than ``min_delta``."""
+    if min_delta < 0:
+        raise ValueError("min_delta must be nonnegative")
+    return math.isfinite(current) and current < best - min_delta
+
+
 def collate_genomic(
     batch: list[tuple[Tensor, dict[int, Tensor]]],
 ) -> tuple[Tensor, dict[int, Tensor]]:
@@ -2159,6 +2171,7 @@ def train_epoch_sequence_parallel(
 
 
 __all__ = [
+    "validation_loss_improved",
     "collate_genomic",
     "ModalityConfig",
     "MODALITY_CONFIGS",
