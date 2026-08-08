@@ -174,6 +174,30 @@ def differential_pearson_r(
     )
 
 
+def double_centered_r2(
+    pred: Tensor,
+    true: Tensor,
+    eps: float = 1e-8,
+) -> Tensor:
+    """Compute variance explained after track and cell-type centering.
+
+    Inputs have shape ``(regions, bins, cell_types)`` or
+    ``(observations, cell_types)``. Flattened genomic observations form rows
+    and output cell types form columns. Prediction and target matrices are
+    independently centered over observations within each track and then over
+    cell types within each observation before computing ``1 - SSE / SST``.
+    """
+    pred_matrix = pred.float().reshape(-1, pred.shape[-1])
+    true_matrix = true.float().reshape(-1, true.shape[-1])
+    pred_centered = double_center(pred_matrix)
+    true_centered = double_center(true_matrix)
+    residual_sum_squares = (true_centered - pred_centered).pow(2).sum()
+    total_sum_squares = true_centered.pow(2).sum()
+    if total_sum_squares <= eps:
+        return torch.tensor(float("nan"), device=true.device)
+    return 1.0 - residual_sum_squares / total_sum_squares
+
+
 def compute_metrics(
     pred: Tensor,
     true: Tensor,
@@ -195,6 +219,7 @@ def compute_metrics(
             - bin_pearson_r: Mean bin-level correlation (across tracks)
             - bin_pearson_r_per_track: Per-track bin-level correlation
             - differential_pearson_r: Double-centered differential correlation
+            - double_centered_r2: Variance explained after double centering
     """
     results = {}
 
@@ -209,6 +234,7 @@ def compute_metrics(
     bin_r = bin_pearson_r(pred, true, eps=eps)  # (tracks,)
     results["bin_pearson_r"] = bin_r.mean().item()
     results["differential_pearson_r"] = differential_pearson_r(pred, true, eps=eps).item()
+    results["double_centered_r2"] = double_centered_r2(pred, true, eps=eps).item()
 
     # Add per-track metrics if track names provided
     if track_names is not None:

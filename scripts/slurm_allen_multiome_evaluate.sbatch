@@ -17,7 +17,7 @@ export PYTHONPATH="$PWD/src:$PWD:${PYTHONPATH:-}"
 
 : "${PRETRAINED_WEIGHTS:=/gpfs/commons/home/daknowles/projects/mpragent/outputs/models/alphagenome/model_all_folds.safetensors}"
 python scripts/evaluate_allen_multiome.py \
-  --manifest "${MANIFEST:-finetuning_output/allen_multiome/manifest.json}" \
-  --checkpoint "${CHECKPOINT:-finetuning_output/allen_multiome/run/best_model.delta.pth}" \
+  --manifest "${MANIFEST:-finetuning_output/allen_multiome_v0/manifest.json}" \
+  --checkpoint "${CHECKPOINT:-finetuning_output/allen_multiome_v0/run/best_model.delta.pth}" \
   --pretrained-weights "$PRETRAINED_WEIGHTS" \
-  --output "${OUTPUT:-finetuning_output/allen_multiome/run/heldout_metrics.json}"
+  --output "${OUTPUT:-finetuning_output/allen_multiome_v0/run/heldout_metrics.json}"

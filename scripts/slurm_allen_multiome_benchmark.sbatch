@@ -16,4 +16,4 @@ export PYTHONPATH="$PWD/src:$PWD:${PYTHONPATH:-}"
 
 python scripts/prepare_singlebrain_finemap_benchmark.py \
   --gtf "${GTF:-/gpfs/commons/groups/knowles_lab/index/hg38/gencode.v49.basic.annotation.gtf.gz}" \
-  --output "${OUTPUT:-finetuning_output/allen_multiome/run/variant_effects/benchmark_variants.tsv.gz}"
+  --output "${OUTPUT:-finetuning_output/allen_multiome_v0/run/variant_effects/benchmark_variants.tsv.gz}"

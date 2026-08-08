@@ -8,7 +8,7 @@ ATAC supervision uses every available BigWig at 128 bp resolution. RNA supervisi
 
 Chromosome splits are generated independently for each assembly. Human uses chromosomes 8 and 9 for validation and test. Other assemblies prefer the same labels when present and otherwise use deterministic primary-contig ranks. Metrics are recorded for each species and split, including profile correlation, bin correlation, differential correlation, and loss.
 
-Variant scoring uses human ATAC and RNA heads on fine-mapped variants. The benchmark defines every variant-gene fine-map row with SuSiE PIP greater than 0.75 as positive. It samples one negative with PIP less than 0.01 per positive, without replacement, within base-2 distance-to-TSS strata. The reported discrimination metrics are AUROC and average precision for maximum absolute predicted effect. Distance matching is checked with a two-sample Kolmogorov-Smirnov statistic.
+Variant scoring uses human ATAC and RNA heads on fine-mapped variants. The benchmark defines every variant-gene fine-map row with SuSiE PIP greater than 0.75 as positive. It samples one negative with PIP less than 0.01 per positive, without replacement, within SingleBrain cell type and base-2 distance-to-TSS strata. SingleBrain subclusters map to Allen broad classes, Ast to Astrocyte, End to Endo, Ext to Glut tracks, IN to non-MSN/non-dopaminergic/non-cholinergic GABA tracks, MG to Microglia, OD to mature Oligo tracks, and OPC to OPC. The reported discrimination metrics are overall and class-specific AUROC and average precision for the maximum absolute effect among matched tracks. Distance matching is checked with a two-sample Kolmogorov-Smirnov statistic.
 
 The requested fine-map path was absent. The data are available through the project’s public `singlebrain_full_finemap` location. Production results will be added after the smoke and full jobs complete.
 
@@ -23,3 +23,5 @@ Delta checkpoint reload and six-head evaluation completed. ATAC and RNA effects 
 ## 2026-08-08, production progress
 
 The production run completed four epochs and was partway through epoch five at the latest check. Mean validation loss decreased from 0.11236 after epoch one to 0.10660 after epoch four. Epoch-four validation losses were 0.13295 for human, 0.05517 for macaque, and 0.13168 for marmoset. Evaluation and variant scoring remain dependency-gated on training.
+
+Held-out evaluation uses 128 bp double-centered R2 as its primary metric. Prediction and target matrices are separately centered over genomic observations within each output track and over output cell types within each observation, then scored as one minus residual sum of squares divided by centered target sum of squares. Profile, bin-level, and differential Pearson correlations remain secondary diagnostics.

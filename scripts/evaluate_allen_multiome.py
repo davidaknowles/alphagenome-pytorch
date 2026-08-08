@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -90,8 +91,18 @@ def main() -> None:
             compact_metrics = {
                 key: value for key, value in metrics.items() if not key.endswith("_values")
             }
+            primary_by_head = {
+                head_name: compact_metrics[f"{head_name}_128bp_double_centered_r2"]
+                for head_name in head_names
+            }
+            finite_primary = [value for value in primary_by_head.values() if math.isfinite(value)]
             species_results[split] = {
                 "chromosome": config[f"{split}_chromosome"],
+                "primary_metric": {
+                    "name": "128bp_double_centered_r2",
+                    "mean": sum(finite_primary) / len(finite_primary) if finite_primary else float("nan"),
+                    "by_head": primary_by_head,
+                },
                 "loss": loss,
                 "metrics": compact_metrics,
                 "n_windows": len(loader.dataset),

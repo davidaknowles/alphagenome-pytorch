@@ -22,8 +22,10 @@ from alphagenome_pytorch.variant_scoring import (
     VariantScoringModel,
 )
 from alphagenome_pytorch.variant_scoring.benchmark import (
+    allen_track_indices,
     load_gene_tss,
     select_pip_matched_variants,
+    singlebrain_cell_class,
 )
 
 
@@ -92,7 +94,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for variant scoring")
     device = torch.device("cuda")
-    model, _ = load_finetuned_model(
+    model, metadata = load_finetuned_model(
         checkpoint_path=args.checkpoint,
         pretrained_weights=args.pretrained_weights,
         device=device,
@@ -132,8 +134,15 @@ def main() -> None:
         result = dict(row)
         for scorer, score in zip(scorers, scores, strict=True):
             values = score.scores.float().cpu().numpy()
-            result[f"{scorer.requested_output.value}_max_abs"] = float(np.max(np.abs(values)))
-            result[f"{scorer.requested_output.value}_mean_abs"] = float(np.mean(np.abs(values)))
+            modality = scorer.requested_output.value
+            head_name = "human_atac" if modality == "atac" else "human_rna_seq"
+            track_names = metadata["track_names"][head_name]
+            indices = allen_track_indices(row["celltype"], track_names)
+            matched_values = values[indices]
+            result[f"{modality}_max_abs"] = float(np.max(np.abs(matched_values)))
+            result[f"{modality}_mean_abs"] = float(np.mean(np.abs(matched_values)))
+            result[f"{modality}_matched_tracks"] = ";".join(track_names[index] for index in indices)
+        result["singlebrain_cell_class"] = singlebrain_cell_class(row["celltype"])
         rows.append(result)
         if index % 25 == 0:
             print(f"Processed {index}/{len(variants)} benchmark rows")
@@ -168,6 +177,14 @@ def main() -> None:
         values = frame[f"{modality}_max_abs"].to_numpy(dtype=float)
         metrics[f"{modality}_auroc"] = auroc(labels, values)
         metrics[f"{modality}_average_precision"] = average_precision(labels, values)
+        for class_name, class_frame in frame.groupby("singlebrain_cell_class"):
+            class_labels = class_frame["benchmark_label"].astype(int).to_numpy(dtype=bool)
+            class_values = class_frame[f"{modality}_max_abs"].to_numpy(dtype=float)
+            metrics[f"{modality}_auroc_{class_name}"] = auroc(class_labels, class_values)
+            metrics[f"{modality}_average_precision_{class_name}"] = average_precision(
+                class_labels,
+                class_values,
+            )
     (args.output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
     print(json.dumps(metrics, indent=2))
 

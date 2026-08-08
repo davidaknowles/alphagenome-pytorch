@@ -17,8 +17,8 @@ export PYTHONPATH="$PWD/src:$PWD:${PYTHONPATH:-}"
 
 : "${PRETRAINED_WEIGHTS:=/gpfs/commons/home/daknowles/projects/mpragent/outputs/models/alphagenome/model_all_folds.safetensors}"
 python scripts/score_singlebrain_finemap.py \
-  --checkpoint "${CHECKPOINT:-finetuning_output/allen_multiome/run/best_model.delta.pth}" \
+  --checkpoint "${CHECKPOINT:-finetuning_output/allen_multiome_v0/run/best_model.delta.pth}" \
   --pretrained-weights "$PRETRAINED_WEIGHTS" \
   --fasta "${FASTA:-/gpfs/commons/groups/knowles_lab/index/hg38/hg38.fa}" \
-  --benchmark-variants "${BENCHMARK_VARIANTS:-finetuning_output/allen_multiome/run/variant_effects/benchmark_variants.tsv.gz}" \
-  --output-dir "${OUTPUT_DIR:-finetuning_output/allen_multiome/run/variant_effects}"
+  --benchmark-variants "${BENCHMARK_VARIANTS:-finetuning_output/allen_multiome_v0/run/variant_effects/benchmark_variants.tsv.gz}" \
+  --output-dir "${OUTPUT_DIR:-finetuning_output/allen_multiome_v0/run/variant_effects}"

@@ -18,9 +18,9 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 : "${PRETRAINED_WEIGHTS:=/gpfs/commons/home/daknowles/projects/mpragent/outputs/models/alphagenome/model_all_folds.safetensors}"
 python scripts/finetune_allen_multiome.py \
-  --manifest "${MANIFEST:-finetuning_output/allen_multiome/manifest.json}" \
+  --manifest "${MANIFEST:-finetuning_output/allen_multiome_v0/manifest.json}" \
   --pretrained-weights "$PRETRAINED_WEIGHTS" \
-  --output-dir "${OUTPUT_DIR:-finetuning_output/allen_multiome/run}" \
+  --output-dir "${OUTPUT_DIR:-finetuning_output/allen_multiome_v0/run}" \
   --epochs "${EPOCHS:-5}" \
   --batch-size "${BATCH_SIZE:-2}" \
   --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS:-4}" \

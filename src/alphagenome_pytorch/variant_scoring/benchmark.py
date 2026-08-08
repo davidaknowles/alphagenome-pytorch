@@ -31,6 +31,56 @@ def distance_to_tss_bin(distance: int) -> int:
     return 0 if distance < 2 else int(math.log2(distance))
 
 
+def singlebrain_cell_class(cell_type: str) -> str:
+    """Map a SingleBrain fine-map cell type to its broad biological class."""
+    prefixes = {
+        "Ast": "astrocyte",
+        "End": "endothelial",
+        "Ext": "excitatory_neuron",
+        "IN": "inhibitory_neuron",
+        "MG": "microglia",
+        "OD": "oligodendrocyte",
+        "OPC": "opc",
+    }
+    for prefix, class_name in prefixes.items():
+        if cell_type == prefix or cell_type.startswith(prefix):
+            return class_name
+    raise ValueError(f"Unsupported SingleBrain cell type: {cell_type!r}")
+
+
+def allen_track_indices(cell_type: str, track_names: Iterable[str]) -> list[int]:
+    """Return Allen track indices matched to a SingleBrain broad cell class."""
+    class_name = singlebrain_cell_class(cell_type)
+    names = list(track_names)
+
+    def normalized(name: str) -> str:
+        return "".join(character.lower() for character in name if character.isalnum())
+
+    def is_match(name: str) -> bool:
+        compact = normalized(name)
+        if class_name == "astrocyte":
+            return compact == "astrocyte"
+        if class_name == "endothelial":
+            return compact == "endo"
+        if class_name == "excitatory_neuron":
+            return "glut" in compact
+        if class_name == "inhibitory_neuron":
+            excluded = ("msn", "dopa", "cholinergic")
+            return "gaba" in compact and not any(value in compact for value in excluded)
+        if class_name == "microglia":
+            return compact == "microglia"
+        if class_name == "oligodendrocyte":
+            return compact.startswith("oligo")
+        if class_name == "opc":
+            return compact == "opc"
+        return False
+
+    indices = [index for index, name in enumerate(names) if is_match(name)]
+    if not indices:
+        raise ValueError(f"No Allen tracks match SingleBrain cell type {cell_type!r}")
+    return indices
+
+
 def _open_text(path: Path):
     return gzip.open(path, "rt") if path.suffix == ".gz" else path.open()
 
@@ -92,8 +142,11 @@ def select_pip_matched_variants(
     if not positives:
         raise ValueError("No high-PIP variants had matching gene annotations")
 
-    needed = Counter(int(row["distance_to_tss_bin"]) for row in positives)
-    reservoirs: dict[int, list[dict[str, str]]] = defaultdict(list)
+    def matching_stratum(row: dict[str, str]) -> tuple[str, int]:
+        return row.get("celltype", ""), int(row["distance_to_tss_bin"])
+
+    needed = Counter(matching_stratum(row) for row in positives)
+    reservoirs: dict[tuple[str, int], list[dict[str, str]]] = defaultdict(list)
     seen = Counter()
     rng = random.Random(seed)
     for path in input_paths:
@@ -104,37 +157,37 @@ def select_pip_matched_variants(
                 annotated = _annotate_distance(row, gene_tss)
                 if annotated is None:
                     continue
-                distance_bin = int(annotated["distance_to_tss_bin"])
-                capacity = needed.get(distance_bin, 0)
+                stratum = matching_stratum(annotated)
+                capacity = needed.get(stratum, 0)
                 if capacity == 0:
                     continue
-                seen[distance_bin] += 1
-                reservoir = reservoirs[distance_bin]
+                seen[stratum] += 1
+                reservoir = reservoirs[stratum]
                 if len(reservoir) < capacity:
                     reservoir.append(annotated)
                 else:
-                    replacement = rng.randrange(seen[distance_bin])
+                    replacement = rng.randrange(seen[stratum])
                     if replacement < capacity:
                         reservoir[replacement] = annotated
 
     deficient = {
-        distance_bin: (needed[distance_bin], len(reservoirs[distance_bin]))
-        for distance_bin in needed
-        if len(reservoirs[distance_bin]) < needed[distance_bin]
+        stratum: (needed[stratum], len(reservoirs[stratum]))
+        for stratum in needed
+        if len(reservoirs[stratum]) < needed[stratum]
     }
     if deficient:
         raise ValueError(f"Insufficient low-PIP variants in distance strata: {deficient}")
 
-    positives_by_bin: dict[int, list[dict[str, str]]] = defaultdict(list)
+    positives_by_stratum: dict[tuple[str, int], list[dict[str, str]]] = defaultdict(list)
     for row in positives:
-        positives_by_bin[int(row["distance_to_tss_bin"])].append(row)
+        positives_by_stratum[matching_stratum(row)].append(row)
 
     selected = []
     pair_id = 0
-    for distance_bin in sorted(positives_by_bin):
-        negatives = reservoirs[distance_bin]
+    for stratum in sorted(positives_by_stratum):
+        negatives = reservoirs[stratum]
         rng.shuffle(negatives)
-        for positive, negative in zip(positives_by_bin[distance_bin], negatives, strict=True):
+        for positive, negative in zip(positives_by_stratum[stratum], negatives, strict=True):
             positive = dict(positive)
             negative = dict(negative)
             positive["benchmark_label"] = "1"

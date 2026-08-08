@@ -16,7 +16,7 @@ export PYTHONPATH="$PWD/src:$PWD:${PYTHONPATH:-}"
 
 cmd=(
   python scripts/prepare_allen_multiome.py
-  --output-dir "${OUTPUT_DIR:-finetuning_output/allen_multiome}"
+  --output-dir "${OUTPUT_DIR:-finetuning_output/allen_multiome_v0}"
 )
 [[ -n "${LIMIT_TRAIN:-}" ]] && cmd+=(--limit-train "$LIMIT_TRAIN")
 [[ -n "${LIMIT_VALID:-}" ]] && cmd+=(--limit-valid "$LIMIT_VALID")

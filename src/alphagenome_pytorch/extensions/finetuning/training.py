@@ -1049,6 +1049,7 @@ def validate_ddp(
     )
     from alphagenome_pytorch.metrics import (
         bin_pearson_r,
+        double_centered_r2,
         differential_pearson_r,
         profile_pearson_r,
     )
@@ -1793,9 +1794,14 @@ def validate_multihead(
                             all_pred_bins,
                             all_true_bins,
                         ).item()
+                        metrics[f"{modality}_{res}bp_double_centered_r2"] = double_centered_r2(
+                            all_pred_bins,
+                            all_true_bins,
+                        ).item()
                     else:
                         metrics[f"{modality}_{res}bp_bin_pearson_r"] = float("nan")
                         metrics[f"{modality}_{res}bp_differential_pearson_r"] = float("nan")
+                        metrics[f"{modality}_{res}bp_double_centered_r2"] = float("nan")
 
     return avg_loss, metrics
 

@@ -105,6 +105,19 @@ def test_differential_pearson_r_double_centering():
     assert abs(diff_r.item() - 1.0) < 1e-5
 
 
+def test_double_centered_r2():
+    """Double-centered R2 removes track and cell-type offsets."""
+    from alphagenome_pytorch.metrics import double_centered_r2
+
+    true = torch.randn(4, 5, 3)
+    observation_offsets = torch.randn(4, 5, 1) * 10.0
+    track_offsets = torch.randn(1, 1, 3) * 5.0
+    pred = true + observation_offsets + track_offsets
+
+    assert double_centered_r2(pred, true).item() == pytest.approx(1.0, abs=1e-5)
+    assert double_centered_r2(torch.zeros_like(true), true).item() == pytest.approx(0.0)
+
+
 def test_double_center():
     """Double centering should remove row and column means."""
     from alphagenome_pytorch.metrics import double_center
@@ -128,9 +141,11 @@ def test_compute_metrics():
     assert "profile_pearson_r" in metrics
     assert "bin_pearson_r" in metrics
     assert "differential_pearson_r" in metrics
+    assert "double_centered_r2" in metrics
     assert metrics["profile_pearson_r"] > 0.9
     assert metrics["bin_pearson_r"] > 0.9
     assert metrics["differential_pearson_r"] > 0.9
+    assert metrics["double_centered_r2"] > 0.9
 
     # With track names
     track_names = ["track_a", "track_b"]
