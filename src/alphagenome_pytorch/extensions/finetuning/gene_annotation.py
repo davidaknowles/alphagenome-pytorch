@@ -136,6 +136,31 @@ def load_gene_table(
     return gene_rows[keep_cols].reset_index(drop=True)
 
 
+def load_exon_table(gtf_path: str) -> pd.DataFrame:
+    """Load exon coordinates and gene identifiers from a GTF."""
+    try:
+        import pyranges
+    except ImportError:
+        df = read_gtf_features_fallback(gtf_path, features={"exon"})
+    else:
+        pr = pyranges.read_gtf(gtf_path)
+        df = pr.df if hasattr(pr, "df") else pr
+        if "gene_name" not in df.columns and "gene" in df.columns:
+            df["gene_name"] = df["gene"]
+
+    required = {"Chromosome", "Start", "End", "Feature", "gene_id"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"GTF at {gtf_path} is missing exon columns: {sorted(missing)}")
+    exons = df[df["Feature"] == "exon"].copy()
+    if exons.empty:
+        raise ValueError(f"GTF at {gtf_path} contains no exon rows")
+    columns = ["Chromosome", "Start", "End", "gene_id"]
+    if "gene_name" in exons.columns:
+        columns.append("gene_name")
+    return exons[columns].reset_index(drop=True)
+
+
 class GeneMaskExtractor:
     """Per-interval gene-body mask extractor.
 
@@ -290,10 +315,18 @@ def cached_load_gene_table(gtf_path: str, filter_protein_coding: bool = True) ->
     return load_gene_table(gtf_path, filter_protein_coding=filter_protein_coding)
 
 
+@functools.lru_cache(maxsize=4)
+def cached_load_exon_table(gtf_path: str) -> pd.DataFrame:
+    """Cache parsed exon annotations across dataset splits."""
+    return load_exon_table(gtf_path)
+
+
 __all__ = [
     "GeneMaskExtractor",
     "load_gene_table",
+    "load_exon_table",
     "cached_load_gene_table",
+    "cached_load_exon_table",
     "derive_g_max",
     "PAD_NUM_GENES_CEILING",
 ]

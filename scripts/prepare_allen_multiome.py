@@ -181,6 +181,18 @@ def main() -> None:
             "valid_chromosome": valid_chrom,
             "test_chromosome": test_chrom,
         }
+        if species == "macaque":
+            manifest["species"][species].update(
+                {
+                    "expression_var_column": "gene_name",
+                    "annotation_gene_column": "gene_name",
+                    "annotation_chromosome_map": {
+                        **{str(index): f"NC_{41_753 + index:06d}.1" for index in range(1, 21)},
+                        "X": "NC_041774.1",
+                        "Y": "NC_027914.1",
+                    },
+                }
+            )
         if not rna_has_coordinates and species == "marmoset":
             manifest["species"][species].update(
                 {

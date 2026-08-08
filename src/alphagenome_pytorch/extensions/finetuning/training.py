@@ -1635,6 +1635,7 @@ def validate_multihead(
     from alphagenome_pytorch.metrics import (
         bin_pearson_r,
         differential_pearson_r,
+        double_centered_r2,
         profile_pearson_r,
     )
 

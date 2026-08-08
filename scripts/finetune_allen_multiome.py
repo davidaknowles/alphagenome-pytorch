@@ -89,12 +89,14 @@ def build_datasets(manifest: dict, args: argparse.Namespace, split: str):
         )
         rna = GeneExpressionDataset(
             config["fasta"], config["rna_h5ad"],
-            config["gtf"] if not config.get("rna_has_coordinates") else None,
+            config["gtf"],
             bed, sequence_length=manifest["sequence_length"],
             gene_mapping_file=config.get("rna_gene_mapping"),
             expression_gene_column=config.get("expression_gene_column"),
+            expression_var_column=config.get("expression_var_column"),
             annotation_gene_column=config.get("annotation_gene_column", "gene_id"),
             mapping_annotation_gene_column=config.get("mapping_annotation_gene_column"),
+            annotation_chromosome_map=config.get("annotation_chromosome_map"),
         )
         dataset = MultimodalDataset({atac_key: atac, rna_key: rna})
         loaders[species] = make_loader(dataset, args, shuffle=split == "train")

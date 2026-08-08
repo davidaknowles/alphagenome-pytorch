@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH -J ag_allen_prepare
-#SBATCH -p cpu
+#SBATCH -p gpu
+#SBATCH --gres=gpu:b6k:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH -t 04:00:00

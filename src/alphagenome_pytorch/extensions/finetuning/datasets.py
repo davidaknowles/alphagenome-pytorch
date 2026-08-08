@@ -856,19 +856,130 @@ def project_gene_expression_to_bins(
     return targets
 
 
+def normalize_pseudobulk_expression(
+    expression: np.ndarray,
+    n_cells: np.ndarray,
+    *,
+    target_total: float | None = None,
+) -> tuple[np.ndarray, float]:
+    """Convert pseudobulk sums to equal-depth expected counts per cell.
+
+    ``expression`` has shape ``(tracks, genes)``. Each track is divided by its
+    contributing cell count, then rescaled so every track has the same total
+    per-cell coverage. The default target is the median observed per-cell total.
+    """
+    expression = np.asarray(expression, dtype=np.float64)
+    n_cells = np.asarray(n_cells, dtype=np.float64)
+    if expression.ndim != 2 or n_cells.shape != (expression.shape[0],):
+        raise ValueError("expression must be (tracks, genes) and n_cells must be (tracks,)")
+    if np.any(n_cells <= 0) or np.any(expression < 0):
+        raise ValueError("pseudobulk expression must be nonnegative and n_cells positive")
+    per_cell = expression / n_cells[:, None]
+    totals = per_cell.sum(axis=1)
+    if np.any(totals <= 0):
+        raise ValueError("every pseudobulk track must have positive total coverage")
+    if target_total is None:
+        target_total = float(np.median(totals))
+    if not np.isfinite(target_total) or target_total <= 0:
+        raise ValueError("target_total must be positive and finite")
+    normalized = per_cell * (target_total / totals)[:, None]
+    return normalized.astype(np.float32), target_total
+
+
+def project_exon_expression_to_bins(
+    exon_starts: np.ndarray,
+    exon_ends: np.ndarray,
+    exon_gene_lengths: np.ndarray,
+    expression: np.ndarray,
+    *,
+    interval_start: int,
+    interval_end: int,
+    resolution: int = 128,
+) -> np.ndarray:
+    """Project gene totals uniformly over their union-of-exons annotations."""
+    width = int(interval_end) - int(interval_start)
+    if width <= 0 or width % resolution:
+        raise ValueError("Interval width must be positive and divisible by resolution")
+    exon_starts = np.asarray(exon_starts, dtype=np.int64)
+    exon_ends = np.asarray(exon_ends, dtype=np.int64)
+    exon_gene_lengths = np.asarray(exon_gene_lengths, dtype=np.float64)
+    expression = np.asarray(expression, dtype=np.float32)
+    n_exons = exon_starts.size
+    if (
+        exon_ends.shape != (n_exons,)
+        or exon_gene_lengths.shape != (n_exons,)
+        or expression.ndim != 2
+        or expression.shape[0] != n_exons
+    ):
+        raise ValueError("exon arrays and expression rows must have matching lengths")
+    if np.any(exon_gene_lengths <= 0):
+        raise ValueError("exon gene lengths must be positive")
+
+    targets = np.zeros((width // resolution, expression.shape[1]), dtype=np.float32)
+    for exon_start, exon_end, gene_length, gene_values in zip(
+        exon_starts, exon_ends, exon_gene_lengths, expression, strict=True
+    ):
+        clipped_start = max(int(exon_start), interval_start)
+        clipped_end = min(int(exon_end), interval_end)
+        if clipped_end <= clipped_start:
+            continue
+        relative_start = clipped_start - interval_start
+        relative_end = clipped_end - interval_start
+        first_bin = relative_start // resolution
+        last_bin = (relative_end - 1) // resolution
+        density = gene_values / float(gene_length)
+        for bin_index in range(first_bin, last_bin + 1):
+            bin_start = bin_index * resolution
+            bin_end = bin_start + resolution
+            overlap = max(0, min(relative_end, bin_end) - max(relative_start, bin_start))
+            targets[bin_index] += density * overlap
+    return targets
+
+
+def _merge_gene_exons(exons: "pd.DataFrame") -> "pd.DataFrame":
+    """Merge overlapping exons per chromosome and expression-gene index."""
+    import pandas as pd
+
+    records: list[dict[str, int | str]] = []
+    for (chromosome, var_index), group in exons.groupby(
+        ["Chromosome", "_var_index"], sort=False, observed=True
+    ):
+        intervals = sorted(
+            zip(group["Start"].astype(int), group["End"].astype(int), strict=True)
+        )
+        merged: list[tuple[int, int]] = []
+        for start, end in intervals:
+            if end <= start:
+                continue
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        gene_length = sum(end - start for start, end in merged)
+        for start, end in merged:
+            records.append(
+                {
+                    "Chromosome": str(chromosome),
+                    "Start": start,
+                    "End": end,
+                    "_var_index": int(var_index),
+                    "GeneLength": gene_length,
+                }
+            )
+    return pd.DataFrame.from_records(records)
+
+
 class GeneExpressionDataset(GenomicDataset):
     """Genomic sequence dataset supervised by pseudobulk gene expression.
 
     The AnnData matrix must be observations by genes. Each observation becomes
-    one output track. Gene totals are projected onto 128 bp gene-body bins at
+    one output track. Gene totals are projected onto 128 bp exon bins at
     access time, which avoids materializing one BigWig per pseudobulk group.
 
     Args:
         genome_fasta: Reference FASTA path or shared :class:`CachedGenome`.
         h5ad_file: Pseudobulk AnnData file with gene IDs in ``var_names``.
-        gtf_file: Optional matching genome annotation. When ``var`` contains
-            chromosome, start, and stop columns, those coordinates are used
-            directly and no GTF is needed.
+        gtf_file: Matching genome annotation used for exon coordinates.
         bed_file: Input windows for one chromosome split.
         sequence_length: Input width in base pairs.
         cache_genome: Cache selected chromosomes in memory.
@@ -889,8 +1000,12 @@ class GeneExpressionDataset(GenomicDataset):
         filter_protein_coding: bool = False,
         gene_mapping_file: str | None = None,
         expression_gene_column: str | None = None,
+        expression_var_column: str | None = None,
         annotation_gene_column: str = "gene_id",
         mapping_annotation_gene_column: str | None = None,
+        annotation_chromosome_map: dict[str, str] | None = None,
+        n_cells_column: str = "n_cells",
+        normalize_library_size: bool = True,
     ):
         if sequence_length % 128:
             raise ValueError("GeneExpressionDataset sequence_length must be divisible by 128")
@@ -911,122 +1026,128 @@ class GeneExpressionDataset(GenomicDataset):
         matrix = adata.layers[expression_layer] if expression_layer else adata.X
         if sparse.issparse(matrix):
             matrix = matrix.toarray()
-        matrix = np.asarray(matrix, dtype=np.float32)
+        matrix = np.asarray(matrix, dtype=np.float64)
         if matrix.ndim != 2 or matrix.shape != adata.shape:
             raise ValueError(
                 f"Expected an observations-by-genes matrix in {h5ad_file}, got {matrix.shape}"
             )
 
-        coordinate_columns = {"chromosome", "start", "stop"}
-        if coordinate_columns.issubset(adata.var.columns):
-            gene_table = adata.var[["chromosome", "start", "stop"]].copy()
-            gene_table = gene_table.rename(
-                columns={"chromosome": "Chromosome", "start": "Start", "stop": "End"}
-            )
-            gene_table["gene_id"] = adata.var_names.astype(str)
-            gene_table["_var_index"] = np.arange(adata.n_vars, dtype=np.int64)
-            gene_table = gene_table.dropna(subset=["Chromosome", "Start", "End"])
-            gene_table["Start"] = gene_table["Start"].astype(np.int64)
-            gene_table["End"] = gene_table["End"].astype(np.int64)
+        if n_cells_column not in adata.obs.columns:
+            raise ValueError(f"{h5ad_file} is missing obs[{n_cells_column!r}]")
+        n_cells = np.asarray(adata.obs[n_cells_column], dtype=np.float64)
+        if np.any(n_cells <= 0) or np.any(matrix < 0):
+            raise ValueError("pseudobulk expression must be nonnegative and n_cells positive")
+        raw_per_cell_library_sizes = (matrix / n_cells[:, None]).sum(axis=1)
+        if normalize_library_size:
+            matrix, target_total = normalize_pseudobulk_expression(matrix, n_cells)
         else:
-            if gtf_file is None:
-                raise ValueError(
-                    f"{h5ad_file} has no chromosome/start/stop var columns; gtf_file is required"
-                )
-            from .gene_annotation import cached_load_gene_table
+            matrix = (matrix / n_cells[:, None]).astype(np.float32)
+            target_total = float(np.median(matrix.sum(axis=1)))
+        if gtf_file is None:
+            raise ValueError("GeneExpressionDataset requires a GTF for exon projection")
 
-            var_ids = [str(value).split(".", 1)[0] for value in adata.var_names]
-            var_lookup = {gene_id: index for index, gene_id in enumerate(var_ids)}
-            gene_table = cached_load_gene_table(
-                str(gtf_file), filter_protein_coding=filter_protein_coding
-            ).copy()
-            if annotation_gene_column not in gene_table.columns:
+        from .gene_annotation import cached_load_exon_table
+
+        if expression_var_column is None:
+            var_ids = pd.Series(adata.var_names.astype(str), index=adata.var_names)
+        else:
+            if expression_var_column not in adata.var.columns:
                 raise ValueError(
-                    f"Annotation column {annotation_gene_column!r} is absent from {gtf_file}"
+                    f"Expression var column {expression_var_column!r} is absent from {h5ad_file}"
                 )
-            annotation_to_expression = None
-            if gene_mapping_file is not None:
-                if expression_gene_column is None:
-                    raise ValueError(
-                        "expression_gene_column is required with gene_mapping_file"
-                    )
-                mapping = pd.read_csv(gene_mapping_file)
-                mapping_annotation_column = (
-                    mapping_annotation_gene_column or annotation_gene_column
-                )
-                required_mapping_columns = {
-                    expression_gene_column,
-                    mapping_annotation_column,
-                }
-                missing_mapping_columns = required_mapping_columns - set(mapping.columns)
-                if missing_mapping_columns:
-                    raise ValueError(
-                        f"Gene mapping is missing columns {sorted(missing_mapping_columns)}"
-                    )
-                annotation_to_expression = dict(
-                    zip(
-                        mapping[mapping_annotation_column].astype(str),
-                        mapping[expression_gene_column].astype(str).str.split(".").str[0],
-                        strict=True,
-                    )
-                )
-            annotation_ids = gene_table[annotation_gene_column].astype(str)
-            if annotation_to_expression is not None:
-                expression_ids = annotation_ids.map(annotation_to_expression)
-            else:
-                expression_ids = annotation_ids.str.split(".").str[0]
-            gene_table["_var_index"] = expression_ids.map(var_lookup)
-            gene_table = gene_table.dropna(subset=["_var_index"]).copy()
-            gene_table["_var_index"] = gene_table["_var_index"].astype(np.int64)
-        if gene_table.empty:
-            raise ValueError(
-                f"No gene IDs overlap between {h5ad_file} and {gtf_file}"
+            var_ids = adata.var[expression_var_column].astype(str)
+        var_lookup = {
+            gene_id.split(".", 1)[0]: index
+            for index, gene_id in enumerate(var_ids.to_numpy())
+        }
+        exon_table = cached_load_exon_table(str(gtf_file)).copy()
+        if annotation_chromosome_map:
+            exon_table["Chromosome"] = exon_table["Chromosome"].replace(
+                {str(source): str(target) for source, target in annotation_chromosome_map.items()}
             )
+        if annotation_gene_column not in exon_table.columns:
+            raise ValueError(
+                f"Annotation column {annotation_gene_column!r} is absent from {gtf_file}"
+            )
+        annotation_to_expression = None
+        if gene_mapping_file is not None:
+            if expression_gene_column is None:
+                raise ValueError("expression_gene_column is required with gene_mapping_file")
+            mapping = pd.read_csv(gene_mapping_file)
+            mapping_annotation_column = mapping_annotation_gene_column or annotation_gene_column
+            required = {expression_gene_column, mapping_annotation_column}
+            missing = required - set(mapping.columns)
+            if missing:
+                raise ValueError(f"Gene mapping is missing columns {sorted(missing)}")
+            annotation_to_expression = dict(
+                zip(
+                    mapping[mapping_annotation_column].astype(str),
+                    mapping[expression_gene_column].astype(str).str.split(".").str[0],
+                    strict=True,
+                )
+            )
+        annotation_ids = exon_table[annotation_gene_column].astype(str)
+        expression_ids = (
+            annotation_ids.map(annotation_to_expression)
+            if annotation_to_expression is not None
+            else annotation_ids.str.split(".").str[0]
+        )
+        exon_table["_var_index"] = expression_ids.map(var_lookup)
+        exon_table = exon_table.dropna(subset=["_var_index"]).copy()
+        exon_table["_var_index"] = exon_table["_var_index"].astype(np.int64)
+        exon_table = _merge_gene_exons(exon_table)
+        if exon_table.empty:
+            raise ValueError(f"No exon annotations overlap between {h5ad_file} and {gtf_file}")
 
         self.h5ad_file = str(h5ad_file)
         self.gtf_file = str(gtf_file) if gtf_file is not None else None
         self.track_names = [str(value) for value in adata.obs_names]
         self.n_tracks = len(self.track_names)
         self._expression = matrix.T
-        self._genes_by_chrom = {
+        self.n_cells = n_cells
+        self.raw_per_cell_library_sizes = raw_per_cell_library_sizes
+        self.target_library_size = target_total
+        self._exons_by_chrom = {
             str(chrom): frame.sort_values("Start").reset_index(drop=True)
-            for chrom, frame in gene_table.groupby("Chromosome", observed=True)
+            for chrom, frame in exon_table.groupby("Chromosome", observed=True)
         }
         interval_chromosomes = {chrom for chrom, _, _ in self._positions_list}
-        shared_chromosomes = interval_chromosomes.intersection(self._genes_by_chrom)
+        shared_chromosomes = interval_chromosomes.intersection(self._exons_by_chrom)
         if not shared_chromosomes:
             raise ValueError(
-                "No chromosome names overlap between RNA gene coordinates and "
-                f"dataset intervals. RNA chromosomes={sorted(self._genes_by_chrom)[:8]}, "
+                "No chromosome names overlap between RNA exon coordinates and "
+                f"dataset intervals. RNA chromosomes={sorted(self._exons_by_chrom)[:8]}, "
                 f"interval chromosomes={sorted(interval_chromosomes)[:8]}"
             )
 
-        lengths = (gene_table["End"].to_numpy() - gene_table["Start"].to_numpy()).clip(1)
-        bins_per_gene = np.maximum(1.0, lengths.astype(np.float64) / 128.0)
-        matched_expression = self._expression[gene_table["_var_index"].to_numpy()]
-        per_bin = matched_expression / bins_per_gene[:, None]
-        nonzero = per_bin > 0
-        sums = np.where(nonzero, per_bin, 0.0).sum(axis=0, dtype=np.float64)
-        counts = nonzero.sum(axis=0)
-        means = np.divide(sums, counts, out=np.ones_like(sums), where=counts > 0)
+        genes = exon_table.drop_duplicates("_var_index")
+        lengths = genes["GeneLength"].to_numpy(dtype=np.float64)
+        matched_expression = self._expression[genes["_var_index"].to_numpy()]
+        nonzero = matched_expression > 0
+        sums = np.where(nonzero, matched_expression, 0.0).sum(axis=0, dtype=np.float64)
+        covered_bases = (nonzero * lengths[:, None]).sum(axis=0, dtype=np.float64)
+        means = np.divide(
+            sums, covered_bases, out=np.ones_like(sums), where=covered_bases > 0
+        )
         self.track_means = torch.tensor(means, dtype=torch.float32).unsqueeze(0)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
         self._ensure_handles()
         chrom, start, end = self._positions_list[idx]
         sequence = torch.from_numpy(self._get_sequence(chrom, start, end)).float()
-        genes = self._genes_by_chrom.get(chrom)
-        if genes is None:
+        exons = self._exons_by_chrom.get(chrom)
+        if exons is None:
             targets = np.zeros((self.sequence_length // 128, self.n_tracks), dtype=np.float32)
         else:
-            contained = genes[
-                (genes["Start"].to_numpy() >= start)
-                & (genes["End"].to_numpy() <= end)
+            overlapping = exons[
+                (exons["Start"].to_numpy() < end)
+                & (exons["End"].to_numpy() > start)
             ]
-            gene_indices = contained["_var_index"].to_numpy(dtype=np.int64)
-            targets = project_gene_expression_to_bins(
-                contained["Start"].to_numpy(),
-                contained["End"].to_numpy(),
+            gene_indices = overlapping["_var_index"].to_numpy(dtype=np.int64)
+            targets = project_exon_expression_to_bins(
+                overlapping["Start"].to_numpy(),
+                overlapping["End"].to_numpy(),
+                overlapping["GeneLength"].to_numpy(),
                 self._expression[gene_indices],
                 interval_start=start,
                 interval_end=end,
@@ -1145,10 +1266,11 @@ def compute_track_means(
 
     # Compute nonzero_mean per track
     # Use 1.0 as fallback if no nonzero values found (shouldn't happen normally)
-    track_means = np.where(
-        track_nonzero_counts > 0,
-        track_nonzero_sums / track_nonzero_counts,
-        1.0,
+    track_means = np.divide(
+        track_nonzero_sums,
+        track_nonzero_counts,
+        out=np.ones_like(track_nonzero_sums),
+        where=track_nonzero_counts > 0,
     )
 
     if strand_pair_groups is not None:
@@ -1301,6 +1423,8 @@ __all__ = [
     "GenomicDataset",
     "GeneExpressionDataset",
     "project_gene_expression_to_bins",
+    "project_exon_expression_to_bins",
+    "normalize_pseudobulk_expression",
     "MultimodalDataset",
     "collate_multimodal",
     "ATACDataset",

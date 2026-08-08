@@ -8,6 +8,44 @@ import pytest
 import torch
 
 
+def test_normalize_pseudobulk_expression_removes_cell_count_and_library_size():
+    import numpy as np
+
+    from alphagenome_pytorch.extensions.finetuning.datasets import (
+        normalize_pseudobulk_expression,
+    )
+
+    normalized, target_total = normalize_pseudobulk_expression(
+        np.array([[20.0, 80.0], [30.0, 270.0]]),
+        np.array([2.0, 10.0]),
+    )
+
+    assert target_total == pytest.approx(40.0)
+    np.testing.assert_allclose(normalized, [[8.0, 32.0], [4.0, 36.0]])
+    np.testing.assert_allclose(normalized.sum(axis=1), [40.0, 40.0])
+
+
+def test_project_exon_expression_to_bins_preserves_gene_totals():
+    import numpy as np
+
+    from alphagenome_pytorch.extensions.finetuning.datasets import (
+        project_exon_expression_to_bins,
+    )
+
+    targets = project_exon_expression_to_bins(
+        exon_starts=np.array([0, 128, 256]),
+        exon_ends=np.array([64, 192, 512]),
+        exon_gene_lengths=np.array([128, 128, 256]),
+        expression=np.array([[10.0], [10.0], [20.0]]),
+        interval_start=0,
+        interval_end=512,
+        resolution=128,
+    )
+
+    np.testing.assert_allclose(targets[:, 0], [5.0, 5.0, 10.0, 10.0])
+    assert targets.sum() == pytest.approx(30.0)
+
+
 def test_project_gene_expression_to_bins_conserves_contained_gene_totals():
     import numpy as np
 
