@@ -65,25 +65,17 @@ class GeneAnnotation:
 
         # Detect file format
         suffix = self.annotation_path.suffix.lower()
+        name = self.annotation_path.name.lower()
         if suffix == '.parquet':
             self._file_format = 'parquet'
-        elif suffix in ('.gtf', '.gff', '.gff3'):
+        elif suffix in ('.gtf', '.gff', '.gff3') or name.endswith(
+            ('.gtf.gz', '.gff.gz', '.gff3.gz')
+        ):
             self._file_format = 'gtf'
-            # Only check for pyranges when GTF is used
-            try:
-                import pyranges as _pr  # noqa: F401
-                del _pr
-            except ImportError:
-                raise ImportError(
-                    "pyranges is required for GTF files. "
-                    "Install with: pip install pyranges\n"
-                    "Or convert to Parquet for faster loading: "
-                    "python scripts/convert_gtf_to_parquet.py"
-                )
         else:
             raise ValueError(
                 f"Unsupported file format: {suffix}. "
-                f"Expected .parquet, .gtf, .gff, or .gff3"
+                f"Expected .parquet, .gtf[.gz], .gff[.gz], or .gff3[.gz]"
             )
 
     # Keep gtf_path as alias for backward compatibility
@@ -114,10 +106,21 @@ class GeneAnnotation:
         self._df = pd.read_parquet(self.annotation_path)
 
     def _load_from_gtf(self) -> None:
-        """Load annotations from GTF file using pyranges."""
-        import pyranges
-        pr_obj = pyranges.read_gtf(str(self.annotation_path))
-        self._df = pr_obj.df
+        """Load gene and exon annotations from GTF."""
+        try:
+            import pyranges
+        except ImportError:
+            from alphagenome_pytorch.extensions.finetuning.gene_annotation import (
+                read_gtf_features_fallback,
+            )
+
+            self._df = read_gtf_features_fallback(
+                str(self.annotation_path),
+                features={"gene", "exon"},
+            )
+        else:
+            pr_obj = pyranges.read_gtf(str(self.annotation_path))
+            self._df = pr_obj.df
 
     def _build_gene_index(self) -> None:
         """Build index of gene information."""

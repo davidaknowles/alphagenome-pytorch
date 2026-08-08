@@ -518,6 +518,7 @@ class VariantScoringModel:
         organism: str | int | None = None,
         gene_annotation: GeneAnnotation | None = None,
         to_cpu: bool = False,
+        gene_ids: list[str] | None = None,
     ) -> list[VariantScore | list[VariantScore]]:
         """Score a single variant with multiple scorers.
 
@@ -528,6 +529,7 @@ class VariantScoringModel:
             organism: 'human', 'mouse', or index. Uses default_organism if None.
             gene_annotation: Optional GeneAnnotation.
             to_cpu: If True, move scores to CPU and clear GPU cache.
+            gene_ids: Optional target gene IDs for gene-mask scorers.
 
         Returns:
             List of VariantScore objects
@@ -569,6 +571,7 @@ class VariantScoringModel:
                 interval=interval,
                 organism_index=organism_index,
                 gene_annotation=gene_annotation,
+                gene_ids=gene_ids,
                 polya_annotation=self._polya_annotation,
             )
 

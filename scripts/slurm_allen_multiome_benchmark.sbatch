@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH -J ag_allen_cohort
-#SBATCH -p cpu
+#SBATCH -p gpu
+#SBATCH --gres=gpu:b6k:1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=32G
 #SBATCH -t 08:00:00

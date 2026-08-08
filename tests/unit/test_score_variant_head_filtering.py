@@ -185,3 +185,29 @@ def test_score_variant_empty_scorers_runs_all_heads():
     sm.predict_variant = fake_predict_variant
     sm.score_variant(Interval('chr1', 0, seq_len), Variant('chr1', 100, 'A', 'C'), [])
     assert captured['heads'] is None
+
+
+@pytest.mark.unit
+def test_score_variant_forwards_target_gene_ids():
+    sm = _make_model()
+    seq_len = 256
+
+    def fake_predict_variant(interval, variant, organism=None, to_cpu=False,
+                             unified_splicing=False, heads=None):
+        seq = torch.zeros(1, seq_len, 4)
+        outputs = sm.model(seq, torch.zeros(1, dtype=torch.long), heads=heads)
+        return outputs, outputs
+
+    class _RecordingScorer(CenterMaskScorer):
+        def score(self, *args, gene_ids=None, **kwargs):
+            assert gene_ids == ['ENSG1']
+            return super().score(*args, **kwargs)
+
+    sm.predict_variant = fake_predict_variant
+    scorer = _RecordingScorer(OutputType.ATAC, 501, AggregationType.DIFF_LOG2_SUM)
+    sm.score_variant(
+        Interval('chr1', 0, seq_len),
+        Variant('chr1', 100, 'A', 'C'),
+        [scorer],
+        gene_ids=['ENSG1'],
+    )

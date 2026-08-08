@@ -28,8 +28,12 @@ import pandas as pd
 PAD_NUM_GENES_CEILING = 256
 
 
-def _read_gtf_genes_fallback(gtf_path: str) -> pd.DataFrame:
-    """Read gene rows from a GTF when pyranges is unavailable."""
+def read_gtf_features_fallback(
+    gtf_path: str,
+    *,
+    features: set[str] | None = None,
+) -> pd.DataFrame:
+    """Read selected GTF feature rows when pyranges is unavailable."""
     opener = gzip.open if str(gtf_path).endswith(".gz") else open
     rows = []
     attribute_pattern = re.compile(r'([^ ;]+)\s+"([^"]*)"')
@@ -38,7 +42,7 @@ def _read_gtf_genes_fallback(gtf_path: str) -> pd.DataFrame:
             if not line or line.startswith("#"):
                 continue
             fields = line.rstrip("\n").split("\t")
-            if len(fields) != 9 or fields[2] != "gene":
+            if len(fields) != 9 or (features is not None and fields[2] not in features):
                 continue
             attributes = dict(attribute_pattern.findall(fields[8]))
             rows.append(
@@ -56,6 +60,11 @@ def _read_gtf_genes_fallback(gtf_path: str) -> pd.DataFrame:
                 }
             )
     return pd.DataFrame.from_records(rows)
+
+
+def _read_gtf_genes_fallback(gtf_path: str) -> pd.DataFrame:
+    """Read gene rows from a GTF when pyranges is unavailable."""
+    return read_gtf_features_fallback(gtf_path, features={"gene"})
 
 
 def load_gene_table(

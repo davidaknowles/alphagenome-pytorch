@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 from pathlib import Path
 
@@ -16,6 +17,8 @@ from alphagenome_pytorch.extensions.finetuning.checkpointing import load_finetun
 from alphagenome_pytorch.variant_scoring import (
     AggregationType,
     CenterMaskScorer,
+    GeneMaskLFCScorer,
+    GeneMaskMode,
     Interval,
     OutputType,
     Variant,
@@ -39,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--pretrained-weights", type=Path, required=True)
     parser.add_argument("--fasta", type=Path, required=True)
-    parser.add_argument("--gtf", type=Path)
+    parser.add_argument("--gtf", type=Path, required=True)
     parser.add_argument("--benchmark-variants", type=Path)
     parser.add_argument("--finemap-dir", type=Path, default=DEFAULT_FINEMAP)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -47,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--negative-pip", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--limit-pairs", type=int)
-    parser.add_argument("--width", type=int, default=131_072)
+    parser.add_argument("--width", type=int, default=1_048_576)
     return parser.parse_args()
 
 
@@ -80,8 +83,6 @@ def main() -> None:
     if args.benchmark_variants is not None:
         variants = pd.read_csv(args.benchmark_variants, sep="\t", dtype=str).to_dict("records")
     else:
-        if args.gtf is None:
-            raise ValueError("--gtf is required when --benchmark-variants is not supplied")
         fine_map_paths = sorted(args.finemap_dir.glob("*_all.susie_all_pip.tsv.gz"))
         variants = select_pip_matched_variants(
             fine_map_paths,
@@ -103,36 +104,80 @@ def main() -> None:
     model.heads["atac"] = model.heads["human_atac"]
     model.heads["rna_seq"] = model.heads["human_rna_seq"]
     model = model.to(device=device).eval()
-    scoring_model = VariantScoringModel(model, fasta_path=args.fasta, device=device)
+    scoring_model = VariantScoringModel(
+        model,
+        fasta_path=args.fasta,
+        gtf_path=args.gtf,
+        device=device,
+    )
     scorers = [
-        CenterMaskScorer(OutputType.ATAC, 100_001, AggregationType.DIFF_LOG2_SUM, resolution=128),
-        CenterMaskScorer(OutputType.RNA_SEQ, 100_001, AggregationType.DIFF_LOG2_SUM, resolution=128),
+        CenterMaskScorer(OutputType.ATAC, 501, AggregationType.DIFF_LOG2_SUM, resolution=128),
+        GeneMaskLFCScorer(OutputType.RNA_SEQ, GeneMaskMode.EXONS, resolution=128),
     ]
     rows = []
     score_cache = {}
+    skip_counts: Counter[str] = Counter()
+    selected_pair_ids = {row["match_pair_id"] for row in variants}
     for index, row in enumerate(variants, start=1):
         variant = Variant(
             chromosome=row["chr"], position=int(row["pos"]),
             reference_bases=row["ref"], alternate_bases=row["alt"],
             name=row.get("variant_id", ""),
         )
+        gene_id = row["feature"].split(".", 1)[0]
+        interval = Interval.centered_on(variant.chromosome, variant.position - 1, args.width)
         variant_key = (
             variant.chromosome,
             variant.position,
             variant.reference_bases,
             variant.alternate_bases,
+            gene_id,
         )
         scores = score_cache.get(variant_key)
         if scores is None:
-            interval = Interval.centered_on(variant.chromosome, variant.position - 1, args.width)
+            gene_info = scoring_model.gene_annotation.get_gene_info(gene_id)
+            if gene_info is None:
+                skip_counts["target_gene_absent_from_gtf"] += 1
+                print(f"Skipping {variant}/{gene_id}: target gene is absent from the GTF")
+                continue
+            if (
+                gene_info["chromosome"] != variant.chromosome
+                or gene_info["start"] < interval.start
+                or gene_info["end"] > interval.end
+            ):
+                skip_counts["target_gene_not_contained_in_context"] += 1
+                print(f"Skipping {variant}/{gene_id}: target gene is not contained in context")
+                continue
             try:
-                scores = scoring_model.score_variant(interval, variant, scorers, to_cpu=True)
+                scores = scoring_model.score_variant(
+                    interval,
+                    variant,
+                    scorers,
+                    gene_ids=[gene_id],
+                    to_cpu=True,
+                )
             except (KeyError, ValueError, RuntimeError) as error:
-                print(f"Skipping {variant}: {error}")
+                skip_counts["scoring_error"] += 1
+                print(f"Skipping {variant}/{gene_id}: {error}")
                 continue
             score_cache[variant_key] = scores
         result = dict(row)
-        for scorer, score in zip(scorers, scores, strict=True):
+        result["context_start"] = interval.start
+        result["context_end"] = interval.end
+        result["target_gene_id"] = gene_id
+        for scorer, score_result in zip(scorers, scores, strict=True):
+            if isinstance(score_result, list):
+                target_scores = [score for score in score_result if score.gene_id == gene_id]
+                if len(target_scores) != 1:
+                    skip_counts["missing_target_gene_exon_score"] += 1
+                    print(
+                        f"Skipping {variant}/{gene_id}: expected one target-gene "
+                        f"score, found {len(target_scores)}"
+                    )
+                    break
+                score = target_scores[0]
+            else:
+                score = score_result
             values = score.scores.float().cpu().numpy()
             modality = scorer.requested_output.value
             head_name = "human_atac" if modality == "atac" else "human_rna_seq"
@@ -142,8 +187,9 @@ def main() -> None:
             result[f"{modality}_max_abs"] = float(np.max(np.abs(matched_values)))
             result[f"{modality}_mean_abs"] = float(np.mean(np.abs(matched_values)))
             result[f"{modality}_matched_tracks"] = ";".join(track_names[index] for index in indices)
-        result["singlebrain_cell_class"] = singlebrain_cell_class(row["celltype"])
-        rows.append(result)
+        else:
+            result["singlebrain_cell_class"] = singlebrain_cell_class(row["celltype"])
+            rows.append(result)
         if index % 25 == 0:
             print(f"Processed {index}/{len(variants)} benchmark rows")
 
@@ -153,7 +199,7 @@ def main() -> None:
         raise RuntimeError("No fine-mapped variants were scored successfully")
     pair_sizes = frame.groupby("match_pair_id")["benchmark_label"].agg(["size", "nunique"])
     complete_pair_ids = pair_sizes.index[(pair_sizes["size"] == 2) & (pair_sizes["nunique"] == 2)]
-    dropped_pairs = int(pair_sizes.shape[0] - complete_pair_ids.size)
+    dropped_pairs = int(len(selected_pair_ids) - complete_pair_ids.size)
     frame = frame[frame["match_pair_id"].isin(complete_pair_ids)].copy()
     if frame.empty:
         raise RuntimeError("No complete positive-negative pairs were scored successfully")
@@ -163,9 +209,17 @@ def main() -> None:
     negative_distances = frame.loc[~labels, "distance_to_tss"].astype(int).to_numpy()
     distance_test = stats.ks_2samp(positive_distances, negative_distances)
     metrics = {
+        "primary_score": "rna_seq_target_gene_exon_lfc_max_abs",
+        "context_width": args.width,
+        "context_center": "variant",
+        "rna_mask": "target_gene_exons",
+        "atac_mask_width": 501,
         "n_rows": len(frame),
-        "n_unique_variants": len(score_cache),
+        "n_selected_pairs": len(selected_pair_ids),
+        "n_scored_variant_gene_pairs": len(score_cache),
+        "n_unique_variants": frame["variant_id"].nunique(),
         "n_dropped_pairs": dropped_pairs,
+        "skip_counts": dict(sorted(skip_counts.items())),
         "n_positive": int(labels.sum()),
         "n_negative": int((~labels).sum()),
         "positive_pip_gt": args.positive_pip,
