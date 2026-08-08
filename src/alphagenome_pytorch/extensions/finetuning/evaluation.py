@@ -408,12 +408,27 @@ def compute_all_metrics(
             profile_rs.append(0.0)
     profile_rs = np.array(profile_rs)
 
-    pred_counts = preds.sum(axis=1).flatten()
-    target_counts = targets.sum(axis=1).flatten()
-    if np.std(pred_counts) > 1e-10 and np.std(target_counts) > 1e-10:
-        count_r = stats.pearsonr(pred_counts, target_counts)[0]
+    pred_bins = preds.reshape(-1, preds.shape[-1])
+    target_bins = targets.reshape(-1, targets.shape[-1])
+    bin_rs = []
+    for track_idx in range(pred_bins.shape[1]):
+        p = pred_bins[:, track_idx]
+        t = target_bins[:, track_idx]
+        if np.std(p) > 1e-10 and np.std(t) > 1e-10:
+            bin_rs.append(stats.pearsonr(p, t)[0])
+        else:
+            bin_rs.append(0.0)
+    bin_rs = np.array(bin_rs)
+
+    def double_center_np(x: np.ndarray) -> np.ndarray:
+        return x - x.mean(axis=0, keepdims=True) - x.mean(axis=1, keepdims=True) + x.mean()
+
+    pred_diff = double_center_np(pred_bins).ravel()
+    target_diff = double_center_np(target_bins).ravel()
+    if np.std(pred_diff) > 1e-10 and np.std(target_diff) > 1e-10:
+        differential_r = stats.pearsonr(pred_diff, target_diff)[0]
     else:
-        count_r = 0.0
+        differential_r = 0.0
 
     jsd_vals = jsd_per_region(preds, targets)
     jsd_per_reg = jsd_vals.mean(axis=1)
@@ -434,7 +449,9 @@ def compute_all_metrics(
         "profile_pearson_r_all": profile_rs,
         "profile_pearson_r_mean": float(np.mean(profile_rs)),
         "profile_pearson_r_median": float(np.median(profile_rs)),
-        "count_pearson_r": float(count_r),
+        "bin_pearson_r_all": bin_rs,
+        "bin_pearson_r": float(np.mean(bin_rs)),
+        "differential_pearson_r": float(differential_r),
         "jsd_all": jsd_per_reg,
         "jsd_mean": float(np.mean(jsd_per_reg)),
         "jsd_median": float(np.median(jsd_per_reg)),

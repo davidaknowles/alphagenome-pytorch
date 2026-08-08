@@ -40,7 +40,7 @@ import json
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -803,6 +803,238 @@ class GenomicDataset(Dataset):
                 pass
 
 
+def project_gene_expression_to_bins(
+    gene_starts: np.ndarray,
+    gene_ends: np.ndarray,
+    expression: np.ndarray,
+    *,
+    interval_start: int,
+    interval_end: int,
+    resolution: int = 128,
+) -> np.ndarray:
+    """Distribute per-gene totals uniformly over gene-body bins.
+
+    ``expression`` has shape ``(G, T)``, where ``G`` is genes and ``T`` is
+    pseudobulk tracks. The result has shape ``(S / R, T)``, where ``S`` is the
+    interval width and ``R`` is ``resolution``. Each fully contained gene
+    contributes its total expression across its body, preserving that total
+    after binning. Overlapping genes add their contributions.
+    """
+    width = int(interval_end) - int(interval_start)
+    if width <= 0 or width % resolution:
+        raise ValueError(
+            "Interval width must be positive and divisible by resolution, "
+            f"got width={width}, resolution={resolution}"
+        )
+    gene_starts = np.asarray(gene_starts, dtype=np.int64)
+    gene_ends = np.asarray(gene_ends, dtype=np.int64)
+    expression = np.asarray(expression, dtype=np.float32)
+    if expression.ndim != 2 or expression.shape[0] != gene_starts.size:
+        raise ValueError(
+            "expression must have shape (genes, tracks) matching gene coordinates"
+        )
+    if gene_starts.shape != gene_ends.shape:
+        raise ValueError("gene_starts and gene_ends must have matching shapes")
+
+    targets = np.zeros((width // resolution, expression.shape[1]), dtype=np.float32)
+    for gene_start, gene_end, gene_values in zip(
+        gene_starts, gene_ends, expression, strict=True
+    ):
+        if gene_start < interval_start or gene_end > interval_end or gene_end <= gene_start:
+            continue
+        relative_start = int(gene_start) - interval_start
+        relative_end = int(gene_end) - interval_start
+        first_bin = relative_start // resolution
+        last_bin = (relative_end - 1) // resolution
+        density = gene_values / float(gene_end - gene_start)
+        for bin_index in range(first_bin, last_bin + 1):
+            bin_start = bin_index * resolution
+            bin_end = bin_start + resolution
+            overlap = max(0, min(relative_end, bin_end) - max(relative_start, bin_start))
+            if overlap:
+                targets[bin_index] += density * overlap
+    return targets
+
+
+class GeneExpressionDataset(GenomicDataset):
+    """Genomic sequence dataset supervised by pseudobulk gene expression.
+
+    The AnnData matrix must be observations by genes. Each observation becomes
+    one output track. Gene totals are projected onto 128 bp gene-body bins at
+    access time, which avoids materializing one BigWig per pseudobulk group.
+
+    Args:
+        genome_fasta: Reference FASTA path or shared :class:`CachedGenome`.
+        h5ad_file: Pseudobulk AnnData file with gene IDs in ``var_names``.
+        gtf_file: Optional matching genome annotation. When ``var`` contains
+            chromosome, start, and stop columns, those coordinates are used
+            directly and no GTF is needed.
+        bed_file: Input windows for one chromosome split.
+        sequence_length: Input width in base pairs.
+        cache_genome: Cache selected chromosomes in memory.
+        expression_layer: Optional AnnData layer. The default uses ``X``.
+        filter_protein_coding: Restrict annotation to protein-coding genes.
+    """
+
+    def __init__(
+        self,
+        genome_fasta: str | CachedGenome,
+        h5ad_file: str,
+        gtf_file: str | None,
+        bed_file: str,
+        *,
+        sequence_length: int = 131_072,
+        cache_genome: bool = False,
+        expression_layer: str | None = None,
+        filter_protein_coding: bool = False,
+        gene_mapping_file: str | None = None,
+        expression_gene_column: str | None = None,
+        annotation_gene_column: str = "gene_id",
+        mapping_annotation_gene_column: str | None = None,
+    ):
+        if sequence_length % 128:
+            raise ValueError("GeneExpressionDataset sequence_length must be divisible by 128")
+        super().__init__(
+            genome_fasta=genome_fasta,
+            bigwig_files=[],
+            bed_file=bed_file,
+            resolutions=(128,),
+            sequence_length=sequence_length,
+            cache_genome=cache_genome,
+        )
+
+        import anndata
+        import pandas as pd
+        from scipy import sparse
+
+        adata = anndata.read_h5ad(h5ad_file)
+        matrix = adata.layers[expression_layer] if expression_layer else adata.X
+        if sparse.issparse(matrix):
+            matrix = matrix.toarray()
+        matrix = np.asarray(matrix, dtype=np.float32)
+        if matrix.ndim != 2 or matrix.shape != adata.shape:
+            raise ValueError(
+                f"Expected an observations-by-genes matrix in {h5ad_file}, got {matrix.shape}"
+            )
+
+        coordinate_columns = {"chromosome", "start", "stop"}
+        if coordinate_columns.issubset(adata.var.columns):
+            gene_table = adata.var[["chromosome", "start", "stop"]].copy()
+            gene_table = gene_table.rename(
+                columns={"chromosome": "Chromosome", "start": "Start", "stop": "End"}
+            )
+            gene_table["gene_id"] = adata.var_names.astype(str)
+            gene_table["_var_index"] = np.arange(adata.n_vars, dtype=np.int64)
+            gene_table = gene_table.dropna(subset=["Chromosome", "Start", "End"])
+            gene_table["Start"] = gene_table["Start"].astype(np.int64)
+            gene_table["End"] = gene_table["End"].astype(np.int64)
+        else:
+            if gtf_file is None:
+                raise ValueError(
+                    f"{h5ad_file} has no chromosome/start/stop var columns; gtf_file is required"
+                )
+            from .gene_annotation import cached_load_gene_table
+
+            var_ids = [str(value).split(".", 1)[0] for value in adata.var_names]
+            var_lookup = {gene_id: index for index, gene_id in enumerate(var_ids)}
+            gene_table = cached_load_gene_table(
+                str(gtf_file), filter_protein_coding=filter_protein_coding
+            ).copy()
+            if annotation_gene_column not in gene_table.columns:
+                raise ValueError(
+                    f"Annotation column {annotation_gene_column!r} is absent from {gtf_file}"
+                )
+            annotation_to_expression = None
+            if gene_mapping_file is not None:
+                if expression_gene_column is None:
+                    raise ValueError(
+                        "expression_gene_column is required with gene_mapping_file"
+                    )
+                mapping = pd.read_csv(gene_mapping_file)
+                mapping_annotation_column = (
+                    mapping_annotation_gene_column or annotation_gene_column
+                )
+                required_mapping_columns = {
+                    expression_gene_column,
+                    mapping_annotation_column,
+                }
+                missing_mapping_columns = required_mapping_columns - set(mapping.columns)
+                if missing_mapping_columns:
+                    raise ValueError(
+                        f"Gene mapping is missing columns {sorted(missing_mapping_columns)}"
+                    )
+                annotation_to_expression = dict(
+                    zip(
+                        mapping[mapping_annotation_column].astype(str),
+                        mapping[expression_gene_column].astype(str).str.split(".").str[0],
+                        strict=True,
+                    )
+                )
+            annotation_ids = gene_table[annotation_gene_column].astype(str)
+            if annotation_to_expression is not None:
+                expression_ids = annotation_ids.map(annotation_to_expression)
+            else:
+                expression_ids = annotation_ids.str.split(".").str[0]
+            gene_table["_var_index"] = expression_ids.map(var_lookup)
+            gene_table = gene_table.dropna(subset=["_var_index"]).copy()
+            gene_table["_var_index"] = gene_table["_var_index"].astype(np.int64)
+        if gene_table.empty:
+            raise ValueError(
+                f"No gene IDs overlap between {h5ad_file} and {gtf_file}"
+            )
+
+        self.h5ad_file = str(h5ad_file)
+        self.gtf_file = str(gtf_file) if gtf_file is not None else None
+        self.track_names = [str(value) for value in adata.obs_names]
+        self.n_tracks = len(self.track_names)
+        self._expression = matrix.T
+        self._genes_by_chrom = {
+            str(chrom): frame.sort_values("Start").reset_index(drop=True)
+            for chrom, frame in gene_table.groupby("Chromosome", observed=True)
+        }
+        interval_chromosomes = {chrom for chrom, _, _ in self._positions_list}
+        shared_chromosomes = interval_chromosomes.intersection(self._genes_by_chrom)
+        if not shared_chromosomes:
+            raise ValueError(
+                "No chromosome names overlap between RNA gene coordinates and "
+                f"dataset intervals. RNA chromosomes={sorted(self._genes_by_chrom)[:8]}, "
+                f"interval chromosomes={sorted(interval_chromosomes)[:8]}"
+            )
+
+        lengths = (gene_table["End"].to_numpy() - gene_table["Start"].to_numpy()).clip(1)
+        bins_per_gene = np.maximum(1.0, lengths.astype(np.float64) / 128.0)
+        matched_expression = self._expression[gene_table["_var_index"].to_numpy()]
+        per_bin = matched_expression / bins_per_gene[:, None]
+        nonzero = per_bin > 0
+        sums = np.where(nonzero, per_bin, 0.0).sum(axis=0, dtype=np.float64)
+        counts = nonzero.sum(axis=0)
+        means = np.divide(sums, counts, out=np.ones_like(sums), where=counts > 0)
+        self.track_means = torch.tensor(means, dtype=torch.float32).unsqueeze(0)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
+        self._ensure_handles()
+        chrom, start, end = self._positions_list[idx]
+        sequence = torch.from_numpy(self._get_sequence(chrom, start, end)).float()
+        genes = self._genes_by_chrom.get(chrom)
+        if genes is None:
+            targets = np.zeros((self.sequence_length // 128, self.n_tracks), dtype=np.float32)
+        else:
+            contained = genes[
+                (genes["Start"].to_numpy() >= start)
+                & (genes["End"].to_numpy() <= end)
+            ]
+            gene_indices = contained["_var_index"].to_numpy(dtype=np.int64)
+            targets = project_gene_expression_to_bins(
+                contained["Start"].to_numpy(),
+                contained["End"].to_numpy(),
+                self._expression[gene_indices],
+                interval_start=start,
+                interval_end=end,
+                resolution=128,
+            )
+        return sequence, {128: torch.from_numpy(targets)}
+
+
 def compute_track_means(
     bigwig_files: list[str],
     bed_file: str,
@@ -1004,18 +1236,21 @@ class MultimodalDataset(Dataset):
             using the gene_mask from the first such dataset (gene_mask is
             sample-level, not per-modality, so any one source suffices).
         """
-        # Get sequence (and possibly gene_mask) from primary dataset.
+        # Get sequence, primary targets, and possibly gene_mask once.
         primary_result = self._primary_dataset[idx]
         if len(primary_result) == 3:
-            sequence, _, gene_mask = primary_result
+            sequence, primary_targets, gene_mask = primary_result
         else:
-            sequence, _ = primary_result
+            sequence, primary_targets = primary_result
             gene_mask = None
 
         # Get targets from all datasets. If the primary didn't have a
         # gene_mask but another dataset does, use the first one we find.
         modality_targets: dict[str, dict[int, torch.Tensor]] = {}
         for modality, dataset in self.datasets.items():
+            if dataset is self._primary_dataset:
+                modality_targets[modality] = primary_targets
+                continue
             result = dataset[idx]
             if len(result) == 3 and gene_mask is None:
                 _, targets_dict, gene_mask = result
@@ -1064,6 +1299,8 @@ RNASeqDataset = GenomicDataset
 
 __all__ = [
     "GenomicDataset",
+    "GeneExpressionDataset",
+    "project_gene_expression_to_bins",
     "MultimodalDataset",
     "collate_multimodal",
     "ATACDataset",

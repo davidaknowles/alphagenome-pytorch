@@ -102,6 +102,78 @@ def count_pearson_r(
     return pearson_r(pred_counts, true_counts, dim=0, eps=eps)
 
 
+def bin_pearson_r(
+    pred: Tensor,
+    true: Tensor,
+    eps: float = 1e-8,
+) -> Tensor:
+    """Compute Pearson R using bins as observations.
+
+    For predictions with shape ``(N_regions, n_bins, tracks)``, this flattens
+    regions and bins into one observation axis and computes one correlation per
+    track. At 128 bp resolution, this measures whether individual 128 bp bins
+    have the right predicted signal without summing over the whole interval.
+
+    Args:
+        pred: Predictions with shape (N_regions, n_bins, tracks).
+        true: Targets with shape (N_regions, n_bins, tracks).
+        eps: Small epsilon for numerical stability.
+
+    Returns:
+        Per-track correlation with shape (tracks,).
+    """
+    pred_bins = pred.float().reshape(-1, pred.shape[-1])
+    true_bins = true.float().reshape(-1, true.shape[-1])
+    return pearson_r(pred_bins, true_bins, dim=0, eps=eps)
+
+
+def double_center(
+    x: Tensor,
+) -> Tensor:
+    """Remove observation and track means from a 2D matrix.
+
+    ``x`` is expected to have shape ``(observations, tracks)``. For 128 bp
+    differential metrics, observations are flattened ``(region, bin)`` pairs.
+    """
+    x = x.float()
+    return x - x.mean(dim=0, keepdim=True) - x.mean(dim=1, keepdim=True) + x.mean()
+
+
+def differential_pearson_r(
+    pred: Tensor,
+    true: Tensor,
+    eps: float = 1e-8,
+) -> Tensor:
+    """Compute double-centered differential Pearson R.
+
+    For shape ``(N_regions, n_bins, tracks)``, this treats each 128 bp bin in
+    each region as an observation, removes each track's mean, removes each
+    observation's mean across tracks, then computes one Pearson R over all
+    residualized values.
+
+    Args:
+        pred: Predictions with shape (N_regions, n_bins, tracks) or
+            (observations, tracks).
+        true: Targets with the same shape as pred.
+        eps: Small epsilon for numerical stability.
+
+    Returns:
+        Scalar Pearson R over double-centered prediction and target matrices.
+    """
+    pred_matrix = pred.float().reshape(-1, pred.shape[-1])
+    true_matrix = true.float().reshape(-1, true.shape[-1])
+
+    pred_centered = double_center(pred_matrix)
+    true_centered = double_center(true_matrix)
+
+    return pearson_r(
+        pred_centered.reshape(-1),
+        true_centered.reshape(-1),
+        dim=0,
+        eps=eps,
+    )
+
+
 def compute_metrics(
     pred: Tensor,
     true: Tensor,
@@ -120,8 +192,9 @@ def compute_metrics(
         Dictionary with metrics:
             - profile_pearson_r: Mean profile correlation (across batch and tracks)
             - profile_pearson_r_per_track: Per-track mean profile correlation
-            - count_pearson_r: Mean count correlation (across tracks)
-            - count_pearson_r_per_track: Per-track count correlation
+            - bin_pearson_r: Mean bin-level correlation (across tracks)
+            - bin_pearson_r_per_track: Per-track bin-level correlation
+            - differential_pearson_r: Double-centered differential correlation
     """
     results = {}
 
@@ -132,20 +205,16 @@ def compute_metrics(
     # Per-track profile Pearson R (averaged over batch)
     profile_r_per_track = profile_r.mean(dim=0)  # (tracks,)
 
-    # Count Pearson R: correlation over samples after summing positions
-    if pred.shape[0] > 1:  # Need at least 2 samples for meaningful correlation
-        count_r = count_pearson_r(pred, true, eps=eps)  # (tracks,)
-        results["count_pearson_r"] = count_r.mean().item()
-    else:
-        count_r = None
-        results["count_pearson_r"] = float("nan")
+    # Bin Pearson R: correlation over all region/bin observations per track
+    bin_r = bin_pearson_r(pred, true, eps=eps)  # (tracks,)
+    results["bin_pearson_r"] = bin_r.mean().item()
+    results["differential_pearson_r"] = differential_pearson_r(pred, true, eps=eps).item()
 
     # Add per-track metrics if track names provided
     if track_names is not None:
         for i, name in enumerate(track_names):
             results[f"profile_pearson_r_{name}"] = profile_r_per_track[i].item()
-            if count_r is not None:
-                results[f"count_pearson_r_{name}"] = count_r[i].item()
+            results[f"bin_pearson_r_{name}"] = bin_r[i].item()
 
     return results
 
@@ -270,6 +339,9 @@ __all__ = [
     'pearson_r',
     'profile_pearson_r',
     'count_pearson_r',
+    'bin_pearson_r',
+    'double_center',
+    'differential_pearson_r',
     'compute_metrics',
     'spearman_r',
     'AlphaGenomeMetrics',

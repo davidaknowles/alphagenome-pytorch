@@ -148,7 +148,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-valid", type=_positive_int_or_none, default=None)
     parser.add_argument("--limit-test", type=_positive_int_or_none, default=None)
     parser.add_argument("--limit-bigwigs", type=_positive_int_or_none, default=None)
-    parser.add_argument("--batch-size", type=int, default=7)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -156,7 +156,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=int, default=16)
+    parser.add_argument("--mode", choices=("lora", "locon", "lora+locon"), default="lora")
     parser.add_argument("--lora-targets", default="q_proj,v_proj")
+    parser.add_argument("--locon-rank", type=int, default=4)
+    parser.add_argument("--locon-alpha", type=int, default=1)
+    parser.add_argument("--locon-targets", default="")
     parser.add_argument("--resolutions", default="1,128")
     parser.add_argument(
         "--dtype",
@@ -253,7 +257,7 @@ def main() -> None:
         sys.executable,
         str(Path(__file__).with_name("finetune.py")),
         "--mode",
-        "lora",
+        args.mode,
         "--genome",
         str(fasta_path),
         "--modality",
@@ -290,6 +294,12 @@ def main() -> None:
         str(args.lora_alpha),
         "--lora-targets",
         args.lora_targets,
+        "--locon-rank",
+        str(args.locon_rank),
+        "--locon-alpha",
+        str(args.locon_alpha),
+        "--locon-targets",
+        args.locon_targets,
         "--dtype",
         args.dtype,
         "--fp8-recipe",

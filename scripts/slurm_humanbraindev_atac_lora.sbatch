@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J ag_hbd_lora_pt
 #SBATCH -p gpu
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:b6k:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
 #SBATCH -t 24:00:00
@@ -13,8 +13,9 @@ set -euo pipefail
 cd /gpfs/commons/home/daknowles/projects/alphagenome-pytorch
 mkdir -p logs/humanbraindev_atac_lora finetuning_output/humanbraindev_atac_lora
 
+module load "${PYTHON_MODULE:-Python/3.12.3-GCCcore-13.3.0}"
 source ~/venv/torch/bin/activate
-export PYTHONPATH="$PWD/src:$PWD:${PYTHONPATH:-}"
+export PYTHONPATH="$VIRTUAL_ENV/lib/python3.12/site-packages:$PWD/src:$PWD:${PYTHONPATH:-}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib-${USER:-daknowles}}"
 export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/pycache-${USER:-daknowles}-${SLURM_JOB_ID:-manual}}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -33,7 +34,8 @@ cmd=(
   --split-source "${SPLIT_SOURCE:-chromosome}"
   --window-size "${WINDOW_SIZE:-131072}"
   --stride "${STRIDE:-131072}"
-  --batch-size "${BATCH_SIZE:-7}"
+  --mode "${MODE:-lora}"
+  --batch-size "${BATCH_SIZE:-8}"
   --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS:-1}"
   --epochs "${EPOCHS:-5}"
   --lr "${LR:-1e-4}"
@@ -42,6 +44,9 @@ cmd=(
   --lora-rank "${LORA_RANK:-8}"
   --lora-alpha "${LORA_ALPHA:-16}"
   --lora-targets "${LORA_TARGETS:-q_proj,v_proj}"
+  --locon-rank "${LOCON_RANK:-4}"
+  --locon-alpha "${LOCON_ALPHA:-1}"
+  --locon-targets "${LOCON_TARGETS:-}"
   --dtype "${DTYPE:-bfloat16}"
   --fp8-recipe "${FP8_RECIPE:-tensorwise}"
   --fp8-min-feature-multiple "${FP8_MIN_FEATURE_MULTIPLE:-16}"

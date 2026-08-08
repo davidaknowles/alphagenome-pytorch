@@ -75,6 +75,46 @@ def test_count_pearson_r():
     assert count_r_scaled.mean() > 0.5
 
 
+def test_bin_pearson_r():
+    """Test bin Pearson R (correlation over region/bin observations)."""
+    from alphagenome_pytorch.metrics import bin_pearson_r
+
+    n_regions, n_bins, tracks = 8, 16, 3
+    pred = torch.randn(n_regions, n_bins, tracks)
+
+    bin_r = bin_pearson_r(pred, pred)
+    assert bin_r.shape == (tracks,), "Should return one value per track"
+    assert torch.allclose(bin_r, torch.ones_like(bin_r), atol=1e-5)
+
+    noisy = pred + 0.1 * torch.randn_like(pred)
+    bin_r_noisy = bin_pearson_r(pred, noisy)
+    assert bin_r_noisy.mean() > 0.9
+
+
+def test_differential_pearson_r_double_centering():
+    """Differential Pearson should ignore observation and track offsets."""
+    from alphagenome_pytorch.metrics import differential_pearson_r
+
+    n_regions, n_bins, tracks = 4, 5, 3
+    true = torch.randn(n_regions, n_bins, tracks)
+    observation_offsets = torch.randn(n_regions, n_bins, 1) * 10.0
+    track_offsets = torch.randn(1, 1, tracks) * 5.0
+    pred = true + observation_offsets + track_offsets
+
+    diff_r = differential_pearson_r(pred, true)
+    assert abs(diff_r.item() - 1.0) < 1e-5
+
+
+def test_double_center():
+    """Double centering should remove row and column means."""
+    from alphagenome_pytorch.metrics import double_center
+
+    x = torch.randn(12, 4)
+    centered = double_center(x)
+    assert torch.allclose(centered.mean(dim=0), torch.zeros(4), atol=1e-6)
+    assert torch.allclose(centered.mean(dim=1), torch.zeros(12), atol=1e-6)
+
+
 def test_compute_metrics():
     """Test compute_metrics returns all expected keys."""
     from alphagenome_pytorch.metrics import compute_metrics
@@ -86,31 +126,19 @@ def test_compute_metrics():
     # Without track names
     metrics = compute_metrics(pred, true)
     assert "profile_pearson_r" in metrics
-    assert "count_pearson_r" in metrics
+    assert "bin_pearson_r" in metrics
+    assert "differential_pearson_r" in metrics
     assert metrics["profile_pearson_r"] > 0.9
-    assert metrics["count_pearson_r"] > 0.9
+    assert metrics["bin_pearson_r"] > 0.9
+    assert metrics["differential_pearson_r"] > 0.9
 
     # With track names
     track_names = ["track_a", "track_b"]
     metrics = compute_metrics(pred, true, track_names=track_names)
     assert "profile_pearson_r_track_a" in metrics
     assert "profile_pearson_r_track_b" in metrics
-    assert "count_pearson_r_track_a" in metrics
-    assert "count_pearson_r_track_b" in metrics
-
-
-def test_compute_metrics_single_sample():
-    """Test compute_metrics with single sample (count Pearson R should be nan)."""
-    from alphagenome_pytorch.metrics import compute_metrics
-    import math
-
-    # Single sample - count Pearson R is undefined
-    pred = torch.randn(1, 1024, 2)
-    true = pred + 0.1 * torch.randn_like(pred)
-
-    metrics = compute_metrics(pred, true)
-    assert "profile_pearson_r" in metrics
-    assert math.isnan(metrics["count_pearson_r"])
+    assert "bin_pearson_r_track_a" in metrics
+    assert "bin_pearson_r_track_b" in metrics
 
 
 def test_pearson_r_vs_scipy():

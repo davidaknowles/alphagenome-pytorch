@@ -13,6 +13,8 @@ DataFrame with the columns the extractor expects (`Chromosome`, `Start`, `End`,
 from __future__ import annotations
 
 import functools
+import gzip
+import re
 from collections import OrderedDict
 from typing import Tuple
 
@@ -24,6 +26,36 @@ import pandas as pd
 # `GeneVariantScorer.pad_num_genes=256` ceiling. If a window exceeds this we
 # raise rather than silently truncate — same behavior as upstream.
 PAD_NUM_GENES_CEILING = 256
+
+
+def _read_gtf_genes_fallback(gtf_path: str) -> pd.DataFrame:
+    """Read gene rows from a GTF when pyranges is unavailable."""
+    opener = gzip.open if str(gtf_path).endswith(".gz") else open
+    rows = []
+    attribute_pattern = re.compile(r'([^ ;]+)\s+"([^"]*)"')
+    with opener(gtf_path, "rt") as handle:
+        for line in handle:
+            if not line or line.startswith("#"):
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) != 9 or fields[2] != "gene":
+                continue
+            attributes = dict(attribute_pattern.findall(fields[8]))
+            rows.append(
+                {
+                    "Chromosome": fields[0],
+                    "Start": int(fields[3]) - 1,
+                    "End": int(fields[4]),
+                    "Strand": fields[6],
+                    "Feature": fields[2],
+                    "gene_id": attributes.get("gene_id", ""),
+                    "gene_name": attributes.get("gene_name", attributes.get("gene", "")),
+                    "gene_type": attributes.get(
+                        "gene_type", attributes.get("gene_biotype", "")
+                    ),
+                }
+            )
+    return pd.DataFrame.from_records(rows)
 
 
 def load_gene_table(
@@ -42,10 +74,17 @@ def load_gene_table(
             `gene_type == "protein_coding"`. Set False for assemblies / GTFs
             that don't have or use that biotype.
     """
-    import pyranges  # local import: heavy dep, only needed when GTF is supplied
-
-    pr = pyranges.read_gtf(gtf_path)
-    df = pr.df if hasattr(pr, "df") else pr  # pyranges 0.x → .df, 1.x → DataFrame
+    try:
+        import pyranges
+    except ImportError:
+        df = _read_gtf_genes_fallback(gtf_path)
+    else:
+        pr = pyranges.read_gtf(gtf_path)
+        df = pr.df if hasattr(pr, "df") else pr
+        if "gene_type" not in df.columns and "gene_biotype" in df.columns:
+            df["gene_type"] = df["gene_biotype"]
+        if "gene_name" not in df.columns and "gene" in df.columns:
+            df["gene_name"] = df["gene"]
 
     required = {"Chromosome", "Start", "End", "Strand", "Feature", "gene_id"}
     missing = required - set(df.columns)

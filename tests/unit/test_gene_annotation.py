@@ -22,6 +22,25 @@ from alphagenome_pytorch.extensions.finetuning.gene_annotation import (
 )
 
 
+def test_load_gene_table_falls_back_without_pyranges(tmp_path, monkeypatch):
+    import sys
+
+    from alphagenome_pytorch.extensions.finetuning.gene_annotation import load_gene_table
+
+    gtf = tmp_path / "genes.gtf"
+    gtf.write_text(
+        'chr1\ttest\tgene\t11\t30\t.\t+\t.\tgene_id "LOC1"; gene "ABC"; gene_biotype "protein_coding";\n'
+    )
+    monkeypatch.setitem(sys.modules, "pyranges", None)
+
+    table = load_gene_table(str(gtf))
+
+    assert table.loc[0, "Start"] == 10
+    assert table.loc[0, "End"] == 30
+    assert table.loc[0, "gene_name"] == "ABC"
+    assert table.loc[0, "gene_type"] == "protein_coding"
+
+
 def _toy_gene_table() -> pd.DataFrame:
     """Three protein-coding genes on chr1, one on chr2.
 

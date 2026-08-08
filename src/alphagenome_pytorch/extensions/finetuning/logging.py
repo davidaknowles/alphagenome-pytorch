@@ -47,6 +47,10 @@ class TrainingLogger:
         wandb_project: str | None = None,
         wandb_entity: str | None = None,
         run_name: str | None = None,
+        wandb_group: str | None = None,
+        wandb_tags: list[str] | tuple[str, ...] | None = None,
+        wandb_job_type: str | None = None,
+        wandb_mode: str | None = None,
         config: dict | None = None,
         resume_id: str | None = None,
     ) -> None:
@@ -59,6 +63,10 @@ class TrainingLogger:
             wandb_project: W&B project name.
             wandb_entity: W&B entity (team/user).
             run_name: Name for this run.
+            wandb_group: W&B group for related runs.
+            wandb_tags: W&B tags.
+            wandb_job_type: W&B job type.
+            wandb_mode: W&B mode, such as ``online`` or ``offline``.
             config: Configuration dict to save and log to W&B.
             resume_id: W&B run ID for resuming a previous run.
         """
@@ -102,6 +110,10 @@ class TrainingLogger:
                     project=wandb_project or "alphagenome-finetune",
                     entity=wandb_entity,
                     name=run_name,
+                    group=wandb_group,
+                    tags=list(wandb_tags or ()),
+                    job_type=wandb_job_type,
+                    mode=wandb_mode,
                     config=config,
                     dir=str(self.output_dir),
                     id=resume_id,
@@ -161,7 +173,14 @@ class TrainingLogger:
 
         # W&B logging
         if self.use_wandb:
-            self.wandb.log(metrics, step=self.step)
+            wandb_metrics = dict(metrics)
+            if "loss" in metrics:
+                wandb_metrics["step/train_loss"] = metrics["loss"]
+            if "running_loss" in metrics:
+                wandb_metrics["step/running_train_loss"] = metrics["running_loss"]
+            if "learning_rate" in metrics:
+                wandb_metrics["step/learning_rate"] = metrics["learning_rate"]
+            self.wandb.log(wandb_metrics, step=self.step)
 
     def log_epoch(
         self,
@@ -214,6 +233,7 @@ class TrainingLogger:
                 "epoch": epoch,
                 "epoch/train_loss": train_loss,
                 "epoch/val_loss": val_loss,
+                "epoch/valid_loss": val_loss,
                 "epoch/learning_rate": lr,
             }
             if extra:

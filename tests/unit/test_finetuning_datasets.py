@@ -8,6 +8,43 @@ import pytest
 import torch
 
 
+def test_project_gene_expression_to_bins_conserves_contained_gene_totals():
+    import numpy as np
+
+    from alphagenome_pytorch.extensions.finetuning.datasets import (
+        project_gene_expression_to_bins,
+    )
+
+    targets = project_gene_expression_to_bins(
+        gene_starts=np.array([32, 128, -10]),
+        gene_ends=np.array([160, 384, 20]),
+        expression=np.array([[4.0, 8.0], [6.0, 3.0], [100.0, 100.0]]),
+        interval_start=0,
+        interval_end=512,
+        resolution=128,
+    )
+
+    assert targets.shape == (4, 2)
+    np.testing.assert_allclose(targets.sum(axis=0), [10.0, 11.0])
+
+
+def test_project_gene_expression_to_bins_rejects_bad_width():
+    import numpy as np
+
+    from alphagenome_pytorch.extensions.finetuning.datasets import (
+        project_gene_expression_to_bins,
+    )
+
+    with pytest.raises(ValueError, match="divisible"):
+        project_gene_expression_to_bins(
+            np.array([], dtype=int),
+            np.array([], dtype=int),
+            np.empty((0, 1)),
+            interval_start=0,
+            interval_end=129,
+        )
+
+
 class TestGenomicDataset:
     """Tests for GenomicDataset with mock data."""
 

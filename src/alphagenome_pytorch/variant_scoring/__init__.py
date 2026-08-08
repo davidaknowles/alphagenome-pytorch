@@ -87,10 +87,13 @@ from .inference import (
     get_recommended_scorers,
 )
 
-# Visualization utilities
-from .visualization_utils import (
-    visualize_variant,
-)
+def __getattr__(name: str):
+    """Load visualization helpers only when their optional dependencies exist."""
+    if name == "visualize_variant":
+        from .visualization_utils import visualize_variant
+
+        return visualize_variant
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     # Types

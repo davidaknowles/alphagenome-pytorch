@@ -46,8 +46,11 @@ inference = [
     "tqdm",
 ]
 finetuning = [
+    "anndata",
     "pybigwig",
     "pandas",
+    "pyranges",
+    "scipy",
     "tqdm",
     "pyfaidx",
 ]

@@ -752,10 +752,11 @@ def train_epoch_ddp(
 
     # Profiling (only on rank 0)
     do_profile = profile_batches > 0 and is_main_process(rank)
+    profiled_batches = min(profile_batches, len(train_loader)) if do_profile else 0
     profile_stats = ProfilingStats() if do_profile else None
 
     if do_profile:
-        print(f"\n*** PROFILING ENABLED for first {profile_batches} batches ***\n")
+        print(f"\n*** PROFILING ENABLED for first {profiled_batches} batches ***\n")
 
     # Only show progress bar on rank 0
     if is_main_process(rank):
@@ -971,13 +972,13 @@ def train_epoch_ddp(
             accumulated_batches = 0
 
         # Print profiling report after profiling is done
-        if do_profile and batch_idx == profile_batches - 1:
-            print(profile_stats.report(profile_batches))
+        if do_profile and batch_idx == profiled_batches - 1:
+            print(profile_stats.report(profiled_batches))
 
             # Estimate epoch time
             estimated_time = profile_stats.estimated_epoch_time(len(train_loader))
             print(f"\nESTIMATED EPOCH TIME: {estimated_time/60:.1f} minutes ({estimated_time/3600:.2f} hours)")
-            print(f"  Based on {profile_batches} profiled batches, {len(train_loader)} total batches")
+            print(f"  Based on {profiled_batches} profiled batches, {len(train_loader)} total batches")
             print()
 
         # Mark end of batch for next iteration's data loading measurement
@@ -1016,7 +1017,7 @@ def validate_ddp(
 
     This is the enhanced version of validate() with:
     - Distributed Data Parallel (DDP) support with proper tensor gathering
-    - Optional Pearson R computation (profile and count correlations)
+    - Optional Pearson R computation (profile and 128 bp bin correlations)
 
     Args:
         model: AlphaGenome trunk model (may be DDP-wrapped).
@@ -1039,14 +1040,18 @@ def validate_ddp(
     Returns:
         Tuple of (avg_loss, metrics_dict) where metrics_dict contains:
         - Per-resolution losses (e.g., "1bp", "128bp")
-        - Pearson R metrics if compute_pearson=True (profile_pearson_r_mean, count_pearson_r, etc.)
+        - Pearson R metrics if compute_pearson=True
     """
     from alphagenome_pytorch.extensions.finetuning.distributed import (
         gather_tensors,
         is_main_process,
         reduce_tensor,
     )
-    from alphagenome_pytorch.metrics import pearson_r, profile_pearson_r
+    from alphagenome_pytorch.metrics import (
+        bin_pearson_r,
+        differential_pearson_r,
+        profile_pearson_r,
+    )
 
     model.eval()
     head.eval()
@@ -1057,8 +1062,8 @@ def validate_ddp(
 
     # For Pearson R computation - accumulate across ALL batches
     accumulated_profile_r: dict[int, list[Tensor]] = defaultdict(list)
-    accumulated_pred_counts: dict[int, list[Tensor]] = defaultdict(list)
-    accumulated_true_counts: dict[int, list[Tensor]] = defaultdict(list)
+    accumulated_pred_bins: dict[int, list[Tensor]] = defaultdict(list)
+    accumulated_true_bins: dict[int, list[Tensor]] = defaultdict(list)
 
     # Only show progress bar on rank 0
     if is_main_process(rank):
@@ -1146,9 +1151,11 @@ def validate_ddp(
                     batch_profile_r = profile_pearson_r(pred_unscaled, targets)  # (batch, tracks)
                     accumulated_profile_r[res].append(batch_profile_r.float().cpu())
 
-                    # Count Pearson R: store total counts per region (tiny memory)
-                    accumulated_pred_counts[res].append(pred_unscaled.sum(dim=1).float().cpu())  # (batch, tracks)
-                    accumulated_true_counts[res].append(targets.sum(dim=1).float().cpu())
+                    # Bin-level metrics are only logged at 128 bp to avoid
+                    # meaningless full-window sums and excessive 1 bp memory.
+                    if res == 128:
+                        accumulated_pred_bins[res].append(pred_unscaled.float().cpu())
+                        accumulated_true_bins[res].append(targets.float().cpu())
 
             total_loss += loss.item()
             n_batches += 1
@@ -1187,21 +1194,25 @@ def validate_ddp(
                 # Store full distribution for wandb histogram
                 metrics[f"{res}bp_profile_pearson_r_values"] = all_profile_r.flatten().tolist()
 
-            # Count Pearson R (from accumulated counts)
-            if res in accumulated_pred_counts and accumulated_pred_counts[res]:
-                all_pred_counts = torch.cat(accumulated_pred_counts[res], dim=0)  # (N_local, tracks)
-                all_true_counts = torch.cat(accumulated_true_counts[res], dim=0)
+            # 128 bp bin Pearson and double-centered differential Pearson
+            if res == 128 and res in accumulated_pred_bins and accumulated_pred_bins[res]:
+                all_pred_bins = torch.cat(accumulated_pred_bins[res], dim=0)
+                all_true_bins = torch.cat(accumulated_true_bins[res], dim=0)
 
-                # Gather counts from all ranks
                 if world_size > 1:
-                    all_pred_counts = gather_tensors(all_pred_counts, world_size, device)
-                    all_true_counts = gather_tensors(all_true_counts, world_size, device)
+                    all_pred_bins = gather_tensors(all_pred_bins, world_size, device)
+                    all_true_bins = gather_tensors(all_true_bins, world_size, device)
 
-                if all_pred_counts.shape[0] > 1:
-                    count_r = pearson_r(all_pred_counts, all_true_counts, dim=0)  # (tracks,)
-                    metrics[f"{res}bp_count_pearson_r"] = count_r.mean().item()
+                if all_pred_bins.shape[0] * all_pred_bins.shape[1] > 1:
+                    bin_r = bin_pearson_r(all_pred_bins, all_true_bins)
+                    metrics[f"{res}bp_bin_pearson_r"] = bin_r.mean().item()
+                    metrics[f"{res}bp_differential_pearson_r"] = differential_pearson_r(
+                        all_pred_bins,
+                        all_true_bins,
+                    ).item()
                 else:
-                    metrics[f"{res}bp_count_pearson_r"] = float("nan")
+                    metrics[f"{res}bp_bin_pearson_r"] = float("nan")
+                    metrics[f"{res}bp_differential_pearson_r"] = float("nan")
 
     return avg_loss, metrics
 
@@ -1292,10 +1303,11 @@ def train_epoch_multihead(
 
     # Profiling (only on rank 0)
     do_profile = profile_batches > 0 and is_main_process(rank)
+    profiled_batches = min(profile_batches, len(train_loader)) if do_profile else 0
     profile_stats = ProfilingStats() if do_profile else None
 
     if do_profile:
-        print(f"\n*** PROFILING ENABLED for first {profile_batches} batches ***\n")
+        print(f"\n*** PROFILING ENABLED for first {profiled_batches} batches ***\n")
 
     if is_main_process(rank):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
@@ -1544,8 +1556,8 @@ def train_epoch_multihead(
             running_loss = 0.0
             accumulated_batches = 0
 
-        if do_profile and batch_idx == profile_batches - 1:
-            print(profile_stats.report(profile_batches))
+        if do_profile and batch_idx == profiled_batches - 1:
+            print(profile_stats.report(profiled_batches))
             estimated_time = profile_stats.estimated_epoch_time(len(train_loader))
             print(f"\nESTIMATED EPOCH TIME: {estimated_time/60:.1f} minutes ({estimated_time/3600:.2f} hours)")
             print()
@@ -1619,7 +1631,11 @@ def validate_multihead(
         is_main_process,
         reduce_tensor,
     )
-    from alphagenome_pytorch.metrics import pearson_r, profile_pearson_r
+    from alphagenome_pytorch.metrics import (
+        bin_pearson_r,
+        differential_pearson_r,
+        profile_pearson_r,
+    )
 
     model.eval()
     for head in heads.values():
@@ -1631,8 +1647,8 @@ def validate_multihead(
 
     # For Pearson R - per modality and resolution
     accumulated_profile_r: dict[str, dict[int, list[Tensor]]] = {m: defaultdict(list) for m in heads}
-    accumulated_pred_counts: dict[str, dict[int, list[Tensor]]] = {m: defaultdict(list) for m in heads}
-    accumulated_true_counts: dict[str, dict[int, list[Tensor]]] = {m: defaultdict(list) for m in heads}
+    accumulated_pred_bins: dict[str, dict[int, list[Tensor]]] = {m: defaultdict(list) for m in heads}
+    accumulated_true_bins: dict[str, dict[int, list[Tensor]]] = {m: defaultdict(list) for m in heads}
 
     if is_main_process(rank):
         pbar = tqdm(val_loader, desc="Validation")
@@ -1722,8 +1738,9 @@ def validate_multihead(
                         pred_unscaled = predictions_unscaled[res]
                         batch_profile_r = profile_pearson_r(pred_unscaled, targets)
                         accumulated_profile_r[modality][res].append(batch_profile_r.float().cpu())
-                        accumulated_pred_counts[modality][res].append(pred_unscaled.sum(dim=1).float().cpu())
-                        accumulated_true_counts[modality][res].append(targets.sum(dim=1).float().cpu())
+                        if res == 128:
+                            accumulated_pred_bins[modality][res].append(pred_unscaled.float().cpu())
+                            accumulated_true_bins[modality][res].append(targets.float().cpu())
 
                 weighted_modality_loss = modality_loss * modality_weight
                 loss = loss + weighted_modality_loss
@@ -1763,17 +1780,22 @@ def validate_multihead(
                     metrics[f"{modality}_{res}bp_profile_pearson_r_std"] = all_profile_r.std().item()
                     metrics[f"{modality}_{res}bp_profile_pearson_r_values"] = all_profile_r.flatten().tolist()
 
-                if res in accumulated_pred_counts[modality] and accumulated_pred_counts[modality][res]:
-                    all_pred_counts = torch.cat(accumulated_pred_counts[modality][res], dim=0)
-                    all_true_counts = torch.cat(accumulated_true_counts[modality][res], dim=0)
+                if res == 128 and res in accumulated_pred_bins[modality] and accumulated_pred_bins[modality][res]:
+                    all_pred_bins = torch.cat(accumulated_pred_bins[modality][res], dim=0)
+                    all_true_bins = torch.cat(accumulated_true_bins[modality][res], dim=0)
                     if world_size > 1:
-                        all_pred_counts = gather_tensors(all_pred_counts, world_size, device)
-                        all_true_counts = gather_tensors(all_true_counts, world_size, device)
-                    if all_pred_counts.shape[0] > 1:
-                        count_r = pearson_r(all_pred_counts, all_true_counts, dim=0)
-                        metrics[f"{modality}_{res}bp_count_pearson_r"] = count_r.mean().item()
+                        all_pred_bins = gather_tensors(all_pred_bins, world_size, device)
+                        all_true_bins = gather_tensors(all_true_bins, world_size, device)
+                    if all_pred_bins.shape[0] * all_pred_bins.shape[1] > 1:
+                        bin_r = bin_pearson_r(all_pred_bins, all_true_bins)
+                        metrics[f"{modality}_{res}bp_bin_pearson_r"] = bin_r.mean().item()
+                        metrics[f"{modality}_{res}bp_differential_pearson_r"] = differential_pearson_r(
+                            all_pred_bins,
+                            all_true_bins,
+                        ).item()
                     else:
-                        metrics[f"{modality}_{res}bp_count_pearson_r"] = float("nan")
+                        metrics[f"{modality}_{res}bp_bin_pearson_r"] = float("nan")
+                        metrics[f"{modality}_{res}bp_differential_pearson_r"] = float("nan")
 
     return avg_loss, metrics
 

@@ -338,7 +338,7 @@ def compute_all_metrics(
 
     Returns dict with:
         profile_pearson_r_all (N,), profile_pearson_r_mean, profile_pearson_r_median,
-        count_pearson_r, jsd_all (N,), jsd_mean, jsd_median,
+        bin_pearson_r, differential_pearson_r, jsd_all, jsd_mean, jsd_median,
         mse, spearman_global, n_regions
     """
     n_regions = preds.shape[0]
@@ -355,13 +355,28 @@ def compute_all_metrics(
             profile_rs.append(0.0)
     profile_rs = np.array(profile_rs)
 
-    # Count Pearson r: sum signal per region, correlate all at once
-    pred_counts = preds.sum(axis=1).flatten()   # (N * n_tracks,)
-    target_counts = targets.sum(axis=1).flatten()
-    if np.std(pred_counts) > 1e-10 and np.std(target_counts) > 1e-10:
-        count_r = stats.pearsonr(pred_counts, target_counts)[0]
+    # Bin Pearson r: use individual bins as observations, not full-window sums.
+    pred_bins = preds.reshape(-1, preds.shape[-1])
+    target_bins = targets.reshape(-1, targets.shape[-1])
+    bin_rs = []
+    for track_idx in range(pred_bins.shape[1]):
+        p = pred_bins[:, track_idx]
+        t = target_bins[:, track_idx]
+        if np.std(p) > 1e-10 and np.std(t) > 1e-10:
+            bin_rs.append(stats.pearsonr(p, t)[0])
+        else:
+            bin_rs.append(0.0)
+    bin_rs = np.array(bin_rs)
+
+    def double_center_np(x: np.ndarray) -> np.ndarray:
+        return x - x.mean(axis=0, keepdims=True) - x.mean(axis=1, keepdims=True) + x.mean()
+
+    pred_diff = double_center_np(pred_bins).ravel()
+    target_diff = double_center_np(target_bins).ravel()
+    if np.std(pred_diff) > 1e-10 and np.std(target_diff) > 1e-10:
+        differential_r = stats.pearsonr(pred_diff, target_diff)[0]
     else:
-        count_r = 0.0
+        differential_r = 0.0
 
     # JSD per region (average across tracks)
     jsd_vals = jsd_per_region(preds, targets)  # (N, n_tracks)
@@ -384,7 +399,9 @@ def compute_all_metrics(
         "profile_pearson_r_all": profile_rs,
         "profile_pearson_r_mean": float(np.mean(profile_rs)),
         "profile_pearson_r_median": float(np.median(profile_rs)),
-        "count_pearson_r": float(count_r),
+        "bin_pearson_r_all": bin_rs,
+        "bin_pearson_r": float(np.mean(bin_rs)),
+        "differential_pearson_r": float(differential_r),
         "jsd_all": jsd_per_reg,
         "jsd_mean": float(np.mean(jsd_per_reg)),
         "jsd_median": float(np.median(jsd_per_reg)),
@@ -717,7 +734,8 @@ def format_summary_table(
         rows = [
             ("Profile r (mean)", "profile_pearson_r_mean"),
             ("Profile r (median)", "profile_pearson_r_median"),
-            ("Count r", "count_pearson_r"),
+            ("Bin r", "bin_pearson_r"),
+            ("Differential r", "differential_pearson_r"),
             ("JSD (mean)", "jsd_mean"),
             ("JSD (median)", "jsd_median"),
             ("MSE", "mse"),
@@ -953,7 +971,8 @@ def main() -> None:
 
             log.info("  Profile r (mean):  %.4f", ft_m["profile_pearson_r_mean"])
             log.info("  Profile r (median):%.4f", ft_m["profile_pearson_r_median"])
-            log.info("  Count r:           %.4f", ft_m["count_pearson_r"])
+            log.info("  Bin r:             %.4f", ft_m["bin_pearson_r"])
+            log.info("  Differential r:    %.4f", ft_m["differential_pearson_r"])
             log.info("  JSD (mean):        %.4f", ft_m["jsd_mean"])
 
             # Scatter plots
@@ -987,9 +1006,10 @@ def main() -> None:
                 native_metrics_by_res[res] = nat_m
 
                 log.info(
-                    "Native %dbp — Profile r: %.4f, Count r: %.4f, JSD: %.4f",
+                    "Native %dbp: Profile r: %.4f, Bin r: %.4f, Differential r: %.4f, JSD: %.4f",
                     res, nat_m["profile_pearson_r_mean"],
-                    nat_m["count_pearson_r"], nat_m["jsd_mean"],
+                    nat_m["bin_pearson_r"], nat_m["differential_pearson_r"],
+                    nat_m["jsd_mean"],
                 )
 
             # Move models back
