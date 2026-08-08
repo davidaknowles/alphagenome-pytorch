@@ -133,21 +133,24 @@ def main() -> None:
             variant.alternate_bases,
             gene_id,
         )
+        gene_info = scoring_model.gene_annotation.get_gene_info(gene_id)
+        if gene_info is None:
+            skip_counts["target_gene_absent_from_gtf"] += 1
+            print(f"Skipping {variant}/{gene_id}: target gene is absent from the GTF")
+            continue
+        target_tss = (
+            gene_info["end"] - 1 if gene_info["strand"] == "-" else gene_info["start"]
+        )
+        if (
+            gene_info["chromosome"] != variant.chromosome
+            or target_tss < interval.start
+            or target_tss >= interval.end
+        ):
+            skip_counts["target_gene_tss_outside_context"] += 1
+            print(f"Skipping {variant}/{gene_id}: target gene TSS is outside context")
+            continue
         scores = score_cache.get(variant_key)
         if scores is None:
-            gene_info = scoring_model.gene_annotation.get_gene_info(gene_id)
-            if gene_info is None:
-                skip_counts["target_gene_absent_from_gtf"] += 1
-                print(f"Skipping {variant}/{gene_id}: target gene is absent from the GTF")
-                continue
-            if (
-                gene_info["chromosome"] != variant.chromosome
-                or gene_info["start"] < interval.start
-                or gene_info["end"] > interval.end
-            ):
-                skip_counts["target_gene_not_contained_in_context"] += 1
-                print(f"Skipping {variant}/{gene_id}: target gene is not contained in context")
-                continue
             try:
                 scores = scoring_model.score_variant(
                     interval,
@@ -165,6 +168,7 @@ def main() -> None:
         result["context_start"] = interval.start
         result["context_end"] = interval.end
         result["target_gene_id"] = gene_id
+        result["target_gene_tss"] = target_tss
         for scorer, score_result in zip(scorers, scores, strict=True):
             if isinstance(score_result, list):
                 target_scores = [score for score in score_result if score.gene_id == gene_id]
