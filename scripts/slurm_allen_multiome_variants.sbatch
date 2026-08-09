@@ -5,8 +5,9 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
 #SBATCH -t 48:00:00
-#SBATCH -o logs/allen_multiome/%x-%j.out
-#SBATCH -e logs/allen_multiome/%x-%j.err
+#SBATCH --array=0-7
+#SBATCH -o logs/allen_multiome/%x-%A_%a.out
+#SBATCH -e logs/allen_multiome/%x-%A_%a.err
 
 set -euo pipefail
 cd /gpfs/commons/home/daknowles/projects/alphagenome-pytorch
@@ -23,4 +24,6 @@ python scripts/score_singlebrain_finemap.py \
   --fasta "${FASTA:-/gpfs/commons/groups/knowles_lab/index/hg38/hg38.fa}" \
   --gtf "${GTF:-/gpfs/commons/groups/knowles_lab/index/hg38/gencode.v49.basic.annotation.gtf.gz}" \
   --benchmark-variants "${BENCHMARK_VARIANTS:-finetuning_output/allen_multiome_v0/run/variant_effects/benchmark_variants.tsv.gz}" \
-  --output-dir "${OUTPUT_DIR:-finetuning_output/allen_multiome_v0/run/variant_effects}"
+  --output-dir "${OUTPUT_DIR:-finetuning_output/allen_multiome_v0/run/variant_effects}" \
+  --num-shards "${NUM_SHARDS:-8}" \
+  --shard-index "$SLURM_ARRAY_TASK_ID"

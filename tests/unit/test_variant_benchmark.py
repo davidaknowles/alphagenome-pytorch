@@ -9,6 +9,7 @@ from alphagenome_pytorch.variant_scoring.benchmark import (
     distance_to_tss_bin,
     select_pip_matched_variants,
     singlebrain_cell_class,
+    target_gene_context,
 )
 from scripts.score_singlebrain_finemap import average_precision
 
@@ -27,6 +28,18 @@ def test_distance_to_tss_bin():
     assert [distance_to_tss_bin(x) for x in (0, 1, 2, 3, 7, 8)] == [0, 0, 1, 1, 2, 3]
     with pytest.raises(ValueError, match="non-negative"):
         distance_to_tss_bin(-1)
+
+
+def test_target_gene_context_is_fixed_width_and_gene_specific():
+    centered = target_gene_context("chr1", 490, 491, 500, 200, 1_000)
+    assert (centered.start, centered.end) == (400, 600)
+
+    shifted = target_gene_context("chr1", 350, 351, 500, 200, 1_000)
+    assert (shifted.start, shifted.end) == (350, 550)
+
+    boundary = target_gene_context("chr1", 10, 11, 20, 200, 1_000)
+    assert (boundary.start, boundary.end) == (0, 200)
+    assert target_gene_context("chr1", 100, 101, 500, 200, 1_000) is None
 
 
 def test_average_precision_handles_ties_as_one_threshold():

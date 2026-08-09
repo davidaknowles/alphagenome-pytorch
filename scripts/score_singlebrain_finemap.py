@@ -29,6 +29,7 @@ from alphagenome_pytorch.variant_scoring.benchmark import (
     load_gene_tss,
     select_pip_matched_variants,
     singlebrain_cell_class,
+    target_gene_context,
 )
 
 
@@ -51,6 +52,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--limit-pairs", type=int)
     parser.add_argument("--width", type=int, default=1_048_576)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     return parser.parse_args()
 
 
@@ -80,6 +83,8 @@ def average_precision(labels: np.ndarray, scores: np.ndarray) -> float:
 
 def main() -> None:
     args = parse_args()
+    if args.num_shards <= 0 or not 0 <= args.shard_index < args.num_shards:
+        raise ValueError("shard_index must be in [0, num_shards)")
     if args.benchmark_variants is not None:
         variants = pd.read_csv(args.benchmark_variants, sep="\t", dtype=str).to_dict("records")
     else:
@@ -92,6 +97,13 @@ def main() -> None:
             seed=args.seed,
             limit_pairs=args.limit_pairs,
         )
+    variants = [
+        row
+        for row in variants
+        if int(row["match_pair_id"]) % args.num_shards == args.shard_index
+    ]
+    if not variants:
+        raise ValueError("No benchmark pairs were assigned to this shard")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for variant scoring")
     device = torch.device("cuda")
@@ -125,7 +137,6 @@ def main() -> None:
             name=row.get("variant_id", ""),
         )
         gene_id = row["feature"].split(".", 1)[0]
-        interval = Interval.centered_on(variant.chromosome, variant.position - 1, args.width)
         variant_key = (
             variant.chromosome,
             variant.position,
@@ -141,13 +152,25 @@ def main() -> None:
         target_tss = (
             gene_info["end"] - 1 if gene_info["strand"] == "-" else gene_info["start"]
         )
-        if (
-            gene_info["chromosome"] != variant.chromosome
-            or target_tss < interval.start
-            or target_tss >= interval.end
-        ):
-            skip_counts["target_gene_tss_outside_context"] += 1
-            print(f"Skipping {variant}/{gene_id}: target gene TSS is outside context")
+        if gene_info["chromosome"] != variant.chromosome:
+            skip_counts["target_gene_chromosome_mismatch"] += 1
+            print(f"Skipping {variant}/{gene_id}: target gene is on another chromosome")
+            continue
+        fasta_chromosome = variant.chromosome
+        if fasta_chromosome not in scoring_model.fasta.fasta:
+            fasta_chromosome = fasta_chromosome.removeprefix("chr")
+        chromosome_size = len(scoring_model.fasta.fasta[fasta_chromosome])
+        interval = target_gene_context(
+            variant.chromosome,
+            variant.start,
+            variant.start + len(variant.reference_bases),
+            target_tss,
+            args.width,
+            chromosome_size,
+        )
+        if interval is None:
+            skip_counts["variant_gene_pair_outside_context"] += 1
+            print(f"Skipping {variant}/{gene_id}: pair does not fit in one context")
             continue
         scores = score_cache.get(variant_key)
         if scores is None:
@@ -159,7 +182,7 @@ def main() -> None:
                     gene_ids=[gene_id],
                     to_cpu=True,
                 )
-            except (KeyError, ValueError, RuntimeError) as error:
+            except (IndexError, KeyError, ValueError, RuntimeError) as error:
                 skip_counts["scoring_error"] += 1
                 print(f"Skipping {variant}/{gene_id}: {error}")
                 continue
@@ -207,7 +230,8 @@ def main() -> None:
     frame = frame[frame["match_pair_id"].isin(complete_pair_ids)].copy()
     if frame.empty:
         raise RuntimeError("No complete positive-negative pairs were scored successfully")
-    frame.to_csv(args.output_dir / "variant_scores.tsv.gz", sep="\t", index=False)
+    suffix = "" if args.num_shards == 1 else f".shard-{args.shard_index:03d}-of-{args.num_shards:03d}"
+    frame.to_csv(args.output_dir / f"variant_scores{suffix}.tsv.gz", sep="\t", index=False)
     labels = frame["benchmark_label"].astype(int).to_numpy(dtype=bool)
     positive_distances = frame.loc[labels, "distance_to_tss"].astype(int).to_numpy()
     negative_distances = frame.loc[~labels, "distance_to_tss"].astype(int).to_numpy()
@@ -215,7 +239,9 @@ def main() -> None:
     metrics = {
         "primary_score": "rna_seq_target_gene_exon_lfc_max_abs",
         "context_width": args.width,
-        "context_center": "variant",
+        "context_center": "target_gene_tss_shifted_to_include_variant",
+        "num_shards": args.num_shards,
+        "shard_index": args.shard_index,
         "rna_mask": "target_gene_exons",
         "atac_mask_width": 501,
         "n_rows": len(frame),
@@ -243,7 +269,9 @@ def main() -> None:
                 class_labels,
                 class_values,
             )
-    (args.output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+    (args.output_dir / f"metrics{suffix}.json").write_text(
+        json.dumps(metrics, indent=2) + "\n"
+    )
     print(json.dumps(metrics, indent=2))
 
 

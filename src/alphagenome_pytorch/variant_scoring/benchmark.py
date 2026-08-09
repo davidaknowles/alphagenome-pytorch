@@ -11,6 +11,29 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 from alphagenome_pytorch.extensions.finetuning.gene_annotation import load_gene_table
+from alphagenome_pytorch.variant_scoring.types import Interval
+
+
+def target_gene_context(
+    chromosome: str,
+    variant_start: int,
+    variant_end: int,
+    target_tss: int,
+    width: int,
+    chromosome_size: int,
+) -> Interval | None:
+    """Return a fixed-width TSS-centered context containing a variant-gene pair."""
+    if width <= 0 or chromosome_size < width or variant_end <= variant_start:
+        return None
+    required_start = min(variant_start, target_tss)
+    required_end = max(variant_end, target_tss + 1)
+    lower = max(0, required_end - width)
+    upper = min(required_start, chromosome_size - width)
+    if lower > upper:
+        return None
+    ideal = target_tss - width // 2
+    start = min(max(ideal, lower), upper)
+    return Interval(chromosome, start, start + width)
 
 
 def load_gene_tss(gtf_path: str | Path) -> dict[str, tuple[str, int]]:

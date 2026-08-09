@@ -102,3 +102,20 @@ def test_align_alternate_rejects_invalid_shape():
             torch.zeros(2, 1, 16, 4),
             variant_start=0, ref_length=1, alt_length=1, interval_start=0,
         )
+
+
+@pytest.mark.unit
+def test_align_alternate_uses_prediction_resolution():
+    alt = torch.arange(16, dtype=torch.float32).reshape(16, 1)
+    unchanged = align_alternate(
+        alt, variant_start=256, ref_length=1, alt_length=2,
+        interval_start=0, resolution=128,
+    )
+    torch.testing.assert_close(unchanged, alt)
+
+    shifted = align_alternate(
+        alt, variant_start=256, ref_length=1, alt_length=129,
+        interval_start=0, resolution=128,
+    )
+    assert shifted.shape == alt.shape
+    assert shifted[2].item() == pytest.approx(3.0)

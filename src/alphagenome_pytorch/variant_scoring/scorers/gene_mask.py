@@ -178,6 +178,7 @@ class GeneMaskLFCScorer(BaseVariantScorer):
                 len(variant.reference_bases),
                 len(variant.alternate_bases),
                 interval.start,
+                resolution=self._resolution,
             ).unsqueeze(0)
         else:
             alt_preds_aligned = alt_preds
@@ -385,6 +386,7 @@ class GeneMaskActiveScorer(BaseVariantScorer):
                 len(variant.reference_bases),
                 len(variant.alternate_bases),
                 interval.start,
+                resolution=self._resolution,
             ).unsqueeze(0)
         else:
             alt_preds_aligned = alt_preds

@@ -18,6 +18,7 @@ def align_alternate(
     ref_length: int,
     alt_length: int,
     interval_start: int,
+    resolution: int = 1,
 ) -> torch.Tensor:
     """Align ALT predictions to REF coordinate space for indels.
 
@@ -35,6 +36,7 @@ def align_alternate(
         ref_length: Length of reference allele.
         alt_length: Length of alternate allele.
         interval_start: 0-based start of the sequence interval.
+        resolution: Base pairs per prediction position.
 
     Returns:
         Aligned ALT tensor with the same shape as input, in REF coordinate
@@ -48,6 +50,17 @@ def align_alternate(
         raise ValueError(
             f"align_alternate expects (S, T) or (B, S, T), got shape {tuple(alt.shape)}"
         )
+
+    if resolution <= 0:
+        raise ValueError("resolution must be positive")
+    if resolution > 1:
+        relative_start = variant_start - interval_start
+        variant_start = relative_start // resolution
+        ref_end = (relative_start + ref_length + resolution - 1) // resolution
+        alt_end = (relative_start + alt_length + resolution - 1) // resolution
+        ref_length = max(1, ref_end - variant_start)
+        alt_length = max(1, alt_end - variant_start)
+        interval_start = 0
 
     insertion_length = alt_length - ref_length
     deletion_length = -insertion_length
