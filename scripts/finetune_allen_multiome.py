@@ -56,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--locon-targets", default="encoder,decoder")
     parser.add_argument("--atac-weight", type=float, default=1.0)
     parser.add_argument("--rna-weight", type=float, default=1.0)
+    parser.add_argument("--double-centered-loss-weight", type=float, default=1.0)
     parser.add_argument("--track-means-samples", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--log-every", type=int, default=25)
@@ -108,7 +109,7 @@ def build_datasets(manifest: dict, args: argparse.Namespace, split: str):
         if split == "train":
             track_means[atac_key] = compute_track_means(
                 config["atac_bigwigs"], bed,
-                sequence_length=manifest["sequence_length"], resolution=128,
+                sequence_length=manifest["sequence_length"], resolution=1,
                 max_samples=args.track_means_samples,
             )
             track_means[rna_key] = rna.track_means
@@ -151,6 +152,8 @@ def main() -> None:
         raise ValueError("early_stopping_patience must be nonnegative")
     if args.early_stopping_min_delta < 0:
         raise ValueError("early_stopping_min_delta must be nonnegative")
+    if args.double_centered_loss_weight < 0:
+        raise ValueError("double_centered_loss_weight must be nonnegative")
     torch.manual_seed(args.seed)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for AlphaGenome fine-tuning")
@@ -229,6 +232,7 @@ def main() -> None:
                 positional_weight=5.0, count_weight=1.0, epoch=epoch,
                 log_every=args.log_every, accumulation_steps=args.gradient_accumulation_steps,
                 use_amp=True, amp_dtype=torch.bfloat16,
+                double_centered_loss_weight=args.double_centered_loss_weight,
             )
             epoch_train[species] = {"loss": loss, "heads": per_head}
 

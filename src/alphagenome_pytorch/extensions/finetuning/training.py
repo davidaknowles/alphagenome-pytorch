@@ -59,6 +59,44 @@ def validation_metric_improved(
     return math.isfinite(current) and current > best + min_delta
 
 
+def double_centered_correlation_loss(
+    prediction: Tensor,
+    target: Tensor,
+    *,
+    eps: float = 1e-8,
+) -> Tensor:
+    """Return one minus correlation after genomic and track centering."""
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"prediction and target shapes differ: {prediction.shape} != {target.shape}"
+        )
+    prediction_matrix = prediction.float().reshape(-1, prediction.shape[-1])
+    target_matrix = target.float().reshape(-1, target.shape[-1])
+    prediction_centered = (
+        prediction_matrix
+        - prediction_matrix.mean(dim=0, keepdim=True)
+        - prediction_matrix.mean(dim=1, keepdim=True)
+        + prediction_matrix.mean()
+    )
+    target_centered = (
+        target_matrix
+        - target_matrix.mean(dim=0, keepdim=True)
+        - target_matrix.mean(dim=1, keepdim=True)
+        + target_matrix.mean()
+    )
+    prediction_sum_squares = prediction_centered.square().sum()
+    target_sum_squares = target_centered.square().sum()
+    denominator = torch.sqrt(
+        (prediction_sum_squares * target_sum_squares).clamp_min(eps * eps)
+    )
+    correlation = (prediction_centered * target_centered).sum() / denominator
+    return torch.where(
+        target_sum_squares > eps,
+        1.0 - correlation,
+        prediction_centered.sum() * 0.0,
+    )
+
+
 def collate_genomic(
     batch: list[tuple[Tensor, dict[int, Tensor]]],
 ) -> tuple[Tensor, dict[int, Tensor]]:
@@ -1272,6 +1310,7 @@ def train_epoch_multihead(
     gene_loss_weights: dict[str, float] | None = None,
     gene_cross_track_weight: float = 5.0,
     strand_channel_masks: dict[str, Tensor] | None = None,
+    double_centered_loss_weight: float = 0.0,
 ) -> tuple[float, dict[str, float]]:
     """Train for one epoch with multiple modality heads.
 
@@ -1465,6 +1504,19 @@ def train_epoch_multihead(
                 )
 
                 res_loss = loss_dict["loss"] * weight
+
+                if res == 128 and double_centered_loss_weight > 0:
+                    differential_loss = double_centered_correlation_loss(
+                        pred,
+                        targets,
+                    )
+                    res_loss = (
+                        res_loss
+                        + weight * double_centered_loss_weight * differential_loss
+                    )
+                    loss_components[f"{modality}_double_centered_correlation_loss"] = (
+                        differential_loss.item()
+                    )
 
                 # Optional gene LFC term (Decima-style cross-track loss).
                 # Only applies at 1bp resolution to the head whose modality
@@ -2185,6 +2237,7 @@ def train_epoch_sequence_parallel(
 __all__ = [
     "validation_loss_improved",
     "validation_metric_improved",
+    "double_centered_correlation_loss",
     "collate_genomic",
     "ModalityConfig",
     "MODALITY_CONFIGS",

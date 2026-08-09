@@ -13,6 +13,7 @@ from alphagenome_pytorch.extensions.finetuning.training import (
     create_lr_scheduler,
     compute_finetuning_loss,
     collate_genomic,
+    double_centered_correlation_loss,
     MODALITY_CONFIGS,
     ModalityConfig,
     validation_loss_improved,
@@ -36,6 +37,34 @@ def test_validation_metric_improved_respects_min_delta_and_finite_values():
     assert validation_metric_improved(-1.0, float("-inf"))
     with pytest.raises(ValueError, match="nonnegative"):
         validation_metric_improved(0.2, 0.0, min_delta=-0.1)
+
+
+def test_double_centered_correlation_loss_ignores_additive_means():
+    target = torch.tensor(
+        [[[1.0, 3.0], [2.0, 1.0]], [[4.0, 2.0], [1.0, 5.0]]]
+    )
+    position_offset = torch.tensor([[[10.0], [-2.0]], [[3.0], [7.0]]])
+    track_offset = torch.tensor([[[4.0, -6.0]]])
+    prediction = target + position_offset + track_offset
+    assert double_centered_correlation_loss(prediction, target).item() == pytest.approx(0.0)
+
+
+def test_double_centered_correlation_loss_is_scale_invariant():
+    target = torch.tensor([[[1.0, 3.0], [2.0, 1.0], [4.0, 2.0]]])
+    assert double_centered_correlation_loss(target, target).item() == pytest.approx(0.0)
+    assert double_centered_correlation_loss(2 * target, target).item() == pytest.approx(0.0)
+    assert double_centered_correlation_loss(-target, target).item() == pytest.approx(2.0)
+    with pytest.raises(ValueError, match="shapes differ"):
+        double_centered_correlation_loss(target[..., :1], target)
+
+
+def test_double_centered_correlation_loss_zero_target_has_finite_zero_gradient():
+    prediction = torch.randn(2, 8, 3, requires_grad=True)
+    loss = double_centered_correlation_loss(prediction, torch.zeros_like(prediction))
+    loss.backward()
+    assert loss.item() == 0.0
+    assert torch.isfinite(prediction.grad).all()
+    assert prediction.grad.abs().sum().item() == 0.0
 
 @pytest.mark.unit
 class TestCollateGenomic:

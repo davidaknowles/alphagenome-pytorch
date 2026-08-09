@@ -91,9 +91,9 @@ def select_rna_file(rna_dir: Path, species_title: str) -> tuple[Path, bool]:
     import anndata
 
     candidates = [
-        rna_dir / f"{species_title}_HMBA_basalganglia_pseudobulk_aligned.h5ad",
-        rna_dir / f"{species_title}_HMBA_basalganglia_pseudobulk_by_group_correctnorm.h5ad",
         rna_dir / f"{species_title}_HMBA_basalganglia_pseudobulk_by_group.h5ad",
+        rna_dir / f"{species_title}_HMBA_basalganglia_pseudobulk_by_group_correctnorm.h5ad",
+        rna_dir / f"{species_title}_HMBA_basalganglia_pseudobulk_aligned.h5ad",
     ]
     for candidate in candidates:
         if not candidate.exists():
@@ -181,6 +181,8 @@ def main() -> None:
             "valid_chromosome": valid_chrom,
             "test_chromosome": test_chrom,
         }
+        if species == "human":
+            manifest["species"][species]["expression_var_column"] = "gene_id"
         if species == "macaque":
             manifest["species"][species].update(
                 {
@@ -193,13 +195,10 @@ def main() -> None:
                     },
                 }
             )
-        if not rna_has_coordinates and species == "marmoset":
+        if species == "marmoset":
             manifest["species"][species].update(
                 {
-                    "rna_gene_mapping": str((root / "RNA/orthologs_1to1_final.csv").resolve()),
-                    "expression_gene_column": "human_ensembl",
                     "annotation_gene_column": "gene_name",
-                    "mapping_annotation_gene_column": "marmoset_gene",
                 }
             )
 

@@ -1174,8 +1174,8 @@ def compute_track_means(
         bigwig_files: List of BigWig files (one per track).
         bed_file: BED file with training positions.
         sequence_length: Sequence length for each position (default: 1M).
-        resolution: Resolution for computing means (1 or 128). Use 1 for
-            most accurate means, 128 for faster computation.
+        resolution: Retained for API compatibility. Means are always computed
+            per base because prediction scaling applies the output resolution.
         max_samples: Maximum number of samples to use for computing means.
             If None, uses all samples. Using a subset (e.g., 1000) speeds
             up computation while giving a good estimate.
@@ -1249,11 +1249,6 @@ def compute_track_means(
                 values = bw.values(chrom, start, end, numpy=True)
                 values = np.asarray(values, dtype=np.float32)
                 values = np.nan_to_num(values, nan=0.0)
-
-                if resolution > 1:
-                    # Bin and sum
-                    output_len = sequence_length // resolution
-                    values = values.reshape(output_len, resolution).sum(axis=1)
 
                 # Only count non-zero values for nonzero_mean
                 nonzero_vals = values[values != 0]

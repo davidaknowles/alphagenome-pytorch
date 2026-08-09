@@ -26,5 +26,6 @@ python scripts/finetune_allen_multiome.py \
   --early-stopping-min-delta "${EARLY_STOPPING_MIN_DELTA:-0.0}" \
   --batch-size "${BATCH_SIZE:-2}" \
   --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS:-4}" \
+  --double-centered-loss-weight "${DOUBLE_CENTERED_LOSS_WEIGHT:-1.0}" \
   --num-workers "${NUM_WORKERS:-2}" \
   --gradient-checkpointing

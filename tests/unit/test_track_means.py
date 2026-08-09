@@ -70,6 +70,19 @@ class TestComputeTrackMeansStrandPair:
         assert torch.isclose(means[0, 0], torch.tensor(2.0))
         assert torch.isclose(means[0, 1], torch.tensor(4.0))
 
+    def test_track_means_are_base_resolution_scaling_factors(self, synthetic_bigwig_pair):
+        """Head scaling requires per-base means even for a 128 bp output head."""
+        bigwigs, bed = synthetic_bigwig_pair
+        means = compute_track_means(
+            bigwig_files=bigwigs,
+            bed_file=bed,
+            sequence_length=2048,
+            resolution=128,
+        )
+        assert torch.allclose(means, torch.tensor([[2.0, 4.0]]))
+        expected_bin_scales = means * 128
+        assert torch.allclose(expected_bin_scales, torch.tensor([[256.0, 512.0]]))
+
     def test_pairing_averages_paired_strands(self, synthetic_bigwig_pair):
         """With strand_pair_groups=[(0, 1)], both indices receive the average (3.0)."""
         bigwigs, bed = synthetic_bigwig_pair
