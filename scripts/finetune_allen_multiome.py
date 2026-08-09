@@ -24,7 +24,7 @@ from alphagenome_pytorch.extensions.finetuning.datasets import (
 from alphagenome_pytorch.extensions.finetuning.training import (
     create_lr_scheduler,
     train_epoch_multihead,
-    validation_loss_improved,
+    validation_metric_improved,
     validate_multihead,
 )
 from alphagenome_pytorch.extensions.finetuning.transfer import (
@@ -117,6 +117,34 @@ def build_datasets(manifest: dict, args: argparse.Namespace, split: str):
     return loaders, track_names, track_means, resolutions
 
 
+def summarize_validation_r2(epoch_valid: dict) -> dict:
+    """Summarize finite 128 bp double-centered R2 values across all heads."""
+    by_head = {}
+    by_modality = {"atac": [], "rna_seq": []}
+    for species_data in epoch_valid.values():
+        for key, value in species_data["metrics"].items():
+            suffix = "_128bp_double_centered_r2"
+            if not key.endswith(suffix):
+                continue
+            head_name = key[: -len(suffix)]
+            by_head[head_name] = value
+            modality = "rna_seq" if head_name.endswith("_rna_seq") else "atac"
+            if math.isfinite(value):
+                by_modality[modality].append(value)
+    finite_by_head = [value for value in by_head.values() if math.isfinite(value)]
+    if not finite_by_head:
+        raise RuntimeError("Validation produced no finite double-centered R2 values")
+    return {
+        "name": "128bp_double_centered_r2",
+        "mean": sum(finite_by_head) / len(finite_by_head),
+        "by_modality": {
+            modality: sum(values) / len(values) if values else float("nan")
+            for modality, values in by_modality.items()
+        },
+        "by_head": by_head,
+    }
+
+
 def main() -> None:
     args = parse_args()
     if args.early_stopping_patience < 0:
@@ -177,11 +205,17 @@ def main() -> None:
         for name in heads
     }
     resolution_weights = {name: {128: 1.0} for name in heads}
-    run_config = vars(args) | {"manifest_data": manifest, "track_names": track_names}
+    run_config = vars(args) | {
+        "manifest_data": manifest,
+        "track_names": track_names,
+        "early_stopping_metric": "mean_validation_128bp_double_centered_r2",
+        "early_stopping_mode": "max",
+    }
     run_config = {key: str(value) if isinstance(value, Path) else value for key, value in run_config.items()}
     (args.output_dir / "config.json").write_text(json.dumps(run_config, indent=2) + "\n")
 
-    best_loss = float("inf")
+    best_r2 = float("-inf")
+    best_loss = None
     best_epoch = None
     epochs_since_improvement = 0
     stopped_early = False
@@ -208,16 +242,21 @@ def main() -> None:
                 model, species_heads, loader, device,
                 modality_weights, resolution_weights,
                 positional_weight=5.0, count_weight=1.0,
-                compute_pearson=False, use_amp=True, amp_dtype=torch.bfloat16,
+                compute_pearson=True, use_amp=True, amp_dtype=torch.bfloat16,
             )
-            epoch_valid[species] = {"loss": loss, "metrics": metrics}
+            compact_metrics = {
+                key: value for key, value in metrics.items() if not key.endswith("_values")
+            }
+            epoch_valid[species] = {"loss": loss, "metrics": compact_metrics}
         mean_valid = sum(item["loss"] for item in epoch_valid.values()) / len(epoch_valid)
-        improved = validation_loss_improved(
-            mean_valid,
-            best_loss,
+        validation_r2 = summarize_validation_r2(epoch_valid)
+        improved = validation_metric_improved(
+            validation_r2["mean"],
+            best_r2,
             min_delta=args.early_stopping_min_delta,
         )
         if improved:
+            best_r2 = validation_r2["mean"]
             best_loss = mean_valid
             best_epoch = epoch
             epochs_since_improvement = 0
@@ -228,6 +267,7 @@ def main() -> None:
             "train": epoch_train,
             "valid": epoch_valid,
             "mean_valid_loss": mean_valid,
+            "validation_double_centered_r2": validation_r2,
             "is_best": improved,
             "epochs_since_improvement": epochs_since_improvement,
         }
@@ -249,14 +289,15 @@ def main() -> None:
             stopped_early = True
             print(
                 f"Early stopping after {epochs_since_improvement} epochs without "
-                "validation-loss improvement."
+                "validation double-centered R2 improvement."
             )
             break
 
     summary = {
         "epochs_completed": len(history),
         "best_epoch": best_epoch,
-        "best_validation_loss": best_loss,
+        "best_validation_double_centered_r2": best_r2,
+        "validation_loss_at_best_epoch": best_loss,
         "stopped_early": stopped_early,
     }
     (args.output_dir / "training_summary.json").write_text(
