@@ -9,7 +9,7 @@ import math
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from alphagenome_pytorch import AlphaGenome
 from alphagenome_pytorch.extensions.finetuning.adapters import get_adapter_params
@@ -58,10 +58,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rna-weight", type=float, default=1.0)
     parser.add_argument("--double-centered-loss-weight", type=float, default=1.0)
     parser.add_argument("--track-means-samples", type=int, default=64)
+    parser.add_argument("--max-train-samples", type=int)
+    parser.add_argument("--max-valid-samples", type=int)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--head-only", action="store_true")
     return parser.parse_args()
 
 
@@ -78,12 +81,19 @@ def make_loader(dataset: MultimodalDataset, args: argparse.Namespace, shuffle: b
     )
 
 
-def build_datasets(manifest: dict, args: argparse.Namespace, split: str):
+def build_datasets(
+    manifest: dict,
+    args: argparse.Namespace,
+    split: str,
+    rna_sources: dict[str, GeneExpressionDataset] | None = None,
+):
     loaders = {}
     track_names = {}
     track_means = {}
     resolutions = {}
+    rna_datasets = {}
     for species, config in manifest["species"].items():
+        print(f"Building {split} datasets for {species}...", flush=True)
         bed = config["splits"][split]
         atac_key = f"{species}_atac"
         rna_key = f"{species}_rna_seq"
@@ -91,22 +101,34 @@ def build_datasets(manifest: dict, args: argparse.Namespace, split: str):
             config["fasta"], config["atac_bigwigs"], bed,
             resolutions=(128,), sequence_length=manifest["sequence_length"],
         )
-        rna = GeneExpressionDataset(
-            config["fasta"], config["rna_h5ad"],
-            config["gtf"],
-            bed, sequence_length=manifest["sequence_length"],
-            gene_mapping_file=config.get("rna_gene_mapping"),
-            expression_gene_column=config.get("expression_gene_column"),
-            expression_var_column=config.get("expression_var_column"),
-            annotation_gene_column=config.get("annotation_gene_column", "gene_id"),
-            mapping_annotation_gene_column=config.get("mapping_annotation_gene_column"),
-            annotation_chromosome_map=config.get("annotation_chromosome_map"),
-        )
+        if rna_sources is None:
+            rna = GeneExpressionDataset(
+                config["fasta"], config["rna_h5ad"],
+                config["gtf"],
+                bed, sequence_length=manifest["sequence_length"],
+                gene_mapping_file=config.get("rna_gene_mapping"),
+                expression_gene_column=config.get("expression_gene_column"),
+                expression_var_column=config.get("expression_var_column"),
+                annotation_gene_column=config.get("annotation_gene_column", "gene_id"),
+                mapping_annotation_gene_column=config.get("mapping_annotation_gene_column"),
+                annotation_chromosome_map=config.get("annotation_chromosome_map"),
+            )
+        else:
+            rna = rna_sources[species].with_bed_file(bed)
+        rna_datasets[species] = rna
         dataset = MultimodalDataset({atac_key: atac, rna_key: rna})
+        max_samples = (
+            args.max_train_samples if split == "train" else args.max_valid_samples
+        )
+        if max_samples is not None:
+            if max_samples <= 0:
+                raise ValueError(f"max_{split}_samples must be positive")
+            dataset = Subset(dataset, range(min(max_samples, len(dataset))))
         loaders[species] = make_loader(dataset, args, shuffle=split == "train")
         track_names[atac_key] = [Path(path).stem for path in config["atac_bigwigs"]]
         track_names[rna_key] = rna.track_names
         if split == "train":
+            print(f"Computing {species} ATAC track means...", flush=True)
             track_means[atac_key] = compute_track_means(
                 config["atac_bigwigs"], bed,
                 sequence_length=manifest["sequence_length"], resolution=1,
@@ -115,7 +137,8 @@ def build_datasets(manifest: dict, args: argparse.Namespace, split: str):
             track_means[rna_key] = rna.track_means
         resolutions[atac_key] = (128,)
         resolutions[rna_key] = (128,)
-    return loaders, track_names, track_means, resolutions
+        print(f"Finished {split} datasets for {species}.", flush=True)
+    return loaders, track_names, track_means, resolutions, rna_datasets
 
 
 def summarize_validation_r2(epoch_valid: dict) -> dict:
@@ -161,8 +184,12 @@ def main() -> None:
     manifest = json.loads(args.manifest.read_text())
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_loaders, track_names, track_means, resolutions = build_datasets(manifest, args, "train")
-    valid_loaders, valid_names, _, _ = build_datasets(manifest, args, "valid")
+    train_loaders, track_names, track_means, resolutions, train_rna = build_datasets(
+        manifest, args, "train"
+    )
+    valid_loaders, valid_names, _, _, _ = build_datasets(
+        manifest, args, "valid", rna_sources=train_rna
+    )
     if valid_names != track_names:
         raise ValueError("Train and validation track names differ")
 
@@ -177,7 +204,7 @@ def main() -> None:
             "track_means": track_means[head_name],
         }
     transfer_config = TransferConfig(
-        mode=["lora", "locon"],
+        mode="linear" if args.head_only else ["lora", "locon"],
         lora_targets=[value for value in args.lora_targets.split(",") if value],
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
@@ -193,10 +220,32 @@ def main() -> None:
     model = model.to(device=device, dtype=torch.bfloat16)
     heads = {name: model.heads[name] for name in track_names}
 
+    if args.head_only:
+        head_parameter_ids = {
+            id(parameter)
+            for head in heads.values()
+            for parameter in head.parameters()
+        }
+        unexpected_trainable = [
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad and id(parameter) not in head_parameter_ids
+        ]
+        if unexpected_trainable:
+            raise RuntimeError(
+                "Head-only mode left non-head parameters trainable: "
+                f"{unexpected_trainable[:10]}"
+            )
+
     params = get_adapter_params(model)
     for head in heads.values():
         params.extend(parameter for parameter in head.parameters() if parameter.requires_grad)
     unique_params = list({id(parameter): parameter for parameter in params}.values())
+    trainable_count = sum(parameter.numel() for parameter in unique_params)
+    print(
+        f"Transfer mode={transfer_config.mode}; trainable parameters={trainable_count:,}",
+        flush=True,
+    )
     optimizer = torch.optim.AdamW(unique_params, lr=args.lr, weight_decay=args.weight_decay)
     steps_per_epoch = sum(math.ceil(len(loader) / args.gradient_accumulation_steps) for loader in train_loaders.values())
     scheduler = create_lr_scheduler(
@@ -233,6 +282,7 @@ def main() -> None:
                 log_every=args.log_every, accumulation_steps=args.gradient_accumulation_steps,
                 use_amp=True, amp_dtype=torch.bfloat16,
                 double_centered_loss_weight=args.double_centered_loss_weight,
+                frozen_backbone=args.head_only,
             )
             epoch_train[species] = {"loss": loss, "heads": per_head}
 

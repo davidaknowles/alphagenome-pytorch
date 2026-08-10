@@ -17,6 +17,11 @@ export PYTHONPATH="$PWD/src:$PWD:${PYTHONPATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 : "${PRETRAINED_WEIGHTS:=/gpfs/commons/home/daknowles/projects/mpragent/outputs/models/alphagenome/model_all_folds.safetensors}"
+head_only_args=()
+[[ "${HEAD_ONLY:-0}" == "1" ]] && head_only_args+=(--head-only)
+sample_limit_args=()
+[[ -n "${MAX_TRAIN_SAMPLES:-}" ]] && sample_limit_args+=(--max-train-samples "$MAX_TRAIN_SAMPLES")
+[[ -n "${MAX_VALID_SAMPLES:-}" ]] && sample_limit_args+=(--max-valid-samples "$MAX_VALID_SAMPLES")
 python scripts/finetune_allen_multiome.py \
   --manifest "${MANIFEST:-finetuning_output/allen_multiome_v0/manifest.json}" \
   --pretrained-weights "$PRETRAINED_WEIGHTS" \
@@ -26,6 +31,11 @@ python scripts/finetune_allen_multiome.py \
   --early-stopping-min-delta "${EARLY_STOPPING_MIN_DELTA:-0.0}" \
   --batch-size "${BATCH_SIZE:-2}" \
   --gradient-accumulation-steps "${GRADIENT_ACCUMULATION_STEPS:-4}" \
+  --lr "${LR:-1e-4}" \
+  --warmup-steps "${WARMUP_STEPS:-250}" \
+  --track-means-samples "${TRACK_MEANS_SAMPLES:-64}" \
   --double-centered-loss-weight "${DOUBLE_CENTERED_LOSS_WEIGHT:-1.0}" \
   --num-workers "${NUM_WORKERS:-2}" \
-  --gradient-checkpointing
+  --gradient-checkpointing \
+  "${sample_limit_args[@]}" \
+  "${head_only_args[@]}"

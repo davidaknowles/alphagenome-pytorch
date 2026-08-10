@@ -143,6 +143,27 @@ class TestGenomicDataset:
         assert len(dataset) > 0
         assert len(dataset) <= 20
 
+    def test_with_bed_file_reuses_targets_with_new_positions(self, mock_data_dir, tmp_path):
+        from alphagenome_pytorch.extensions.finetuning.datasets import GenomicDataset
+
+        dataset = GenomicDataset(
+            genome_fasta=str(mock_data_dir / "mock_genome.fa"),
+            bigwig_files=[str(mock_data_dir / "mock_rnaseq_track1.bw")],
+            bed_file=str(mock_data_dir / "mock_positions.bed"),
+            resolutions=(128,),
+        )
+        heldout_bed = tmp_path / "heldout.bed"
+        heldout_bed.write_text("chr1\t95677\t95678\n")
+
+        heldout = dataset.with_bed_file(str(heldout_bed))
+
+        assert len(heldout) == 1
+        assert heldout._positions_list != dataset._positions_list
+        assert heldout.bigwig_files is dataset.bigwig_files
+        sequence, targets = heldout[0]
+        assert sequence.shape == (131072, 4)
+        assert targets[128].shape == (1024, 1)
+
 
 class TestRNASeqDataset:
     """Tests for RNASeqDataset alias."""

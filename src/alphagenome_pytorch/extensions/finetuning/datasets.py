@@ -36,6 +36,7 @@ Multi-head example:
 """
 
 from __future__ import annotations
+import copy
 import json
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -503,10 +504,46 @@ class GenomicDataset(Dataset):
         # Calculate output lengths for each resolution
         self.output_lengths = {res: sequence_length // res for res in self.resolutions}
 
-        # Load intervals from BED
-        all_intervals, self._chromosomes = _load_intervals_from_bed(bed_file)
+        self._set_positions_from_bed(bed_file)
 
-        # Get chromosome sizes
+        self.n_tracks = len(bigwig_files)
+
+        # Initialize remaining caches / lazy handles
+        self._cached_bigwigs: list[CachedBigWig] | None = None
+        self._mmap_bigwigs: list[MmapBigWig] | None = None
+        self._fasta = None
+        self._bigwigs = None
+        self._io_executor: ThreadPoolExecutor | None = None
+
+        # Prefetch genome if requested and not already provided
+        if cache_genome and self._cached_genome is None:
+            self._cached_genome = CachedGenome(self.genome_fasta, self._chromosomes)
+
+        # Initialize signal sources
+        if use_mmap:
+            # Load from pre-converted mmap directories
+            print(f"MmapBigWig: Loading {len(bigwig_files)} mmap directories...")
+            self._mmap_bigwigs = [MmapBigWig(p) for p in bigwig_files]
+            print(f"MmapBigWig: Loaded {len(bigwig_files)} mmap sources")
+        elif cache_signals:
+            # Load bigwigs into memory (parallel)
+            print(f"CachedBigWig: Loading {len(bigwig_files)} bigwig file(s)...")
+            self._cached_bigwigs = load_bigwigs_parallel(
+                bigwig_files,
+                self._chromosomes,
+                self._chrom_sizes,
+                max_workers=max_io_workers,
+            )
+            cached_size_mb = sum(
+                sum(arr.nbytes for arr in bw._cache.values())
+                for bw in self._cached_bigwigs
+            ) / 1e6
+            print(f"CachedBigWig: Loaded {len(bigwig_files)} files ({cached_size_mb:.1f} MB)")
+        # Note: ThreadPoolExecutor for lazy reads is created lazily in _ensure_handles()
+        # to be fork-safe with DataLoader workers
+
+    def _set_positions_from_bed(self, bed_file: str) -> None:
+        all_intervals, self._chromosomes = _load_intervals_from_bed(bed_file)
         if self._cached_genome is not None:
             self._chrom_sizes = {
                 ref: size
@@ -524,7 +561,6 @@ class GenomicDataset(Dataset):
             finally:
                 fasta.close()
 
-        # Process intervals: expand from center if needed
         half_len = self.sequence_length // 2
         self._positions_list: list[tuple[str, int, int]] = []
         n_skipped = 0
@@ -562,50 +598,41 @@ class GenomicDataset(Dataset):
         if n_skipped > 0:
             warnings.warn(
                 f"{n_skipped} intervals were skipped because they would exceed "
-                f"chromosome boundaries when expanded to sequence_length={sequence_length}."
+                "chromosome boundaries when expanded to "
+                f"sequence_length={self.sequence_length}."
             )
 
         if n_truncated > 0:
             warnings.warn(
-                f"{n_truncated} intervals were larger than sequence_length={sequence_length} "
-                f"and were centered and truncated, which may lose important flanking regions."
+                f"{n_truncated} intervals were larger than "
+                f"sequence_length={self.sequence_length} and were centered and truncated, "
+                "which may lose important flanking regions."
             )
 
-        self.n_tracks = len(bigwig_files)
+    def with_bed_file(self, bed_file: str) -> "GenomicDataset":
+        """Clone a dataset with new intervals while sharing processed targets.
 
-        # Initialize remaining caches / lazy handles
-        self._cached_bigwigs: list[CachedBigWig] | None = None
-        self._mmap_bigwigs: list[MmapBigWig] | None = None
-        self._fasta = None
-        self._bigwigs = None
-        self._io_executor: ThreadPoolExecutor | None = None
-
-        # Prefetch genome if requested and not already provided
-        if cache_genome and self._cached_genome is None:
-            self._cached_genome = CachedGenome(self.genome_fasta, self._chromosomes)
-
-        # Initialize signal sources
-        if use_mmap:
-            # Load from pre-converted mmap directories
-            print(f"MmapBigWig: Loading {len(bigwig_files)} mmap directories...")
-            self._mmap_bigwigs = [MmapBigWig(p) for p in bigwig_files]
-            print(f"MmapBigWig: Loaded {len(bigwig_files)} mmap sources")
-        elif cache_signals:
-            # Load bigwigs into memory (parallel)
-            print(f"CachedBigWig: Loading {len(bigwig_files)} bigwig file(s)...")
-            self._cached_bigwigs = load_bigwigs_parallel(
-                bigwig_files,
-                self._chromosomes,
-                self._chrom_sizes,
-                max_workers=max_io_workers,
-            )
-            cached_size_mb = sum(
-                sum(arr.nbytes for arr in bw._cache.values())
-                for bw in self._cached_bigwigs
-            ) / 1e6
-            print(f"CachedBigWig: Loaded {len(bigwig_files)} files ({cached_size_mb:.1f} MB)")
-        # Note: ThreadPoolExecutor for lazy reads is created lazily in _ensure_handles()
-        # to be fork-safe with DataLoader workers
+        This is useful for expression datasets whose annotation preprocessing is
+        independent of the train/validation interval split. Lazy file handles are
+        reset so the returned dataset remains DataLoader-worker safe.
+        """
+        if self._cached_bigwigs is not None:
+            raise ValueError("with_bed_file does not support cache_signals=True")
+        cloned = copy.copy(self)
+        cloned._set_positions_from_bed(bed_file)
+        if cloned._cached_genome is not None:
+            missing = cloned._chromosomes - set(cloned._cached_genome._cache)
+            if missing:
+                raise ValueError(
+                    "with_bed_file cannot use chromosomes absent from CachedGenome: "
+                    f"{sorted(missing)}"
+                )
+        cloned._fasta = None
+        cloned._bigwigs = None
+        cloned._io_executor = None
+        if hasattr(cloned, "_owner_pid"):
+            del cloned._owner_pid
+        return cloned
 
     def _ensure_handles(self):
         """Ensure file handles are open for the current process.

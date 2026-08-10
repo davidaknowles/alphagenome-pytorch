@@ -430,7 +430,10 @@ def train_epoch(
     Returns:
         Average training loss for the epoch.
     """
-    model.train()
+    if frozen_backbone:
+        model.eval()
+    else:
+        model.train()
     head.train()
 
     total_loss = 0.0
@@ -1354,7 +1357,10 @@ def train_epoch_multihead(
         reduce_tensor,
     )
 
-    model.train()
+    if frozen_backbone:
+        model.eval()
+    else:
+        model.train()
     for head in heads.values():
         head.train()
 
